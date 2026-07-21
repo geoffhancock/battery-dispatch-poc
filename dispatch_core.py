@@ -44,6 +44,7 @@ from dataclasses import dataclass, field
 import numpy as np
 from scipy.optimize import Bounds, LinearConstraint, milp
 from scipy.sparse import coo_matrix
+from scipy.stats import spearmanr
 
 # Charge/discharge power below this (MW) is treated as numerical zero.
 _TOL = 1e-6
@@ -350,6 +351,128 @@ def run_comparison(
         baseline_signal=baseline_signal,
         carbon_aware_signal=carbon_aware_signal,
     )
+
+
+@dataclass
+class Frontier:
+    """Marginal abatement cost curve: price-only -> carbon-max, swept over carbon price."""
+
+    carbon_prices: np.ndarray          # $/tonne swept
+    tonnes_abated: np.ndarray          # cumulative, vs the price-only baseline
+    revenue_foregone: np.ndarray       # cumulative $, vs the price-only baseline
+    marginal_cost: np.ndarray          # $/tonne between consecutive points (len n-1)
+    baseline_avoided_tonnes: float     # CO2 avoided by price-only dispatch (vs idle)
+    max_avoided_tonnes: float          # CO2 avoided by the carbon-max dispatch
+    capture_fraction: float            # baseline_avoided / max_avoided
+
+
+def default_carbon_prices(price, carbon_tonnes_per_mwh, n=10, headroom=8.0):
+    """A carbon-price sweep wide enough to push dispatch from price-optimal to
+    carbon-optimal. Uses robust (5th-95th pct) spans so spikes don't blow it up."""
+    price = np.asarray(price, dtype=float)
+    carbon = np.asarray(carbon_tonnes_per_mwh, dtype=float)
+    p_span = np.percentile(price, 95) - np.percentile(price, 5)
+    c_span = np.percentile(carbon, 95) - np.percentile(carbon, 5)
+    if c_span <= 0:
+        c_span = abs(np.mean(carbon)) or 1.0
+    lam_max = headroom * (p_span if p_span > 0 else abs(np.mean(price)) or 1.0) / c_span
+    return np.linspace(0.0, lam_max, n)
+
+
+def abatement_frontier(
+    price,
+    carbon,
+    dt,
+    *,
+    power_mw,
+    energy_mwh,
+    rte,
+    carbon_units="lbs/MWh",
+    carbon_prices=None,
+    n_points=10,
+    power_discharge_mw=None,
+    soc_init=0.0,
+    soc_min=0.0,
+    cycle_cost=0.0,
+    terminal_soc=True,
+    guard_simultaneous=True,
+):
+    """Sweep the carbon price and trace the marginal abatement cost curve.
+
+    Solves the price-only baseline once, then one carbon-aware dispatch per carbon
+    price. Everything is measured against the price-only baseline, so ``tonnes_abated``
+    and ``revenue_foregone`` are the *incremental* carbon and cost of being
+    carbon-aware. ``capture_fraction`` is how much of the maximum avoidable CO2 the
+    price-only dispatch already gets for free.
+    """
+    price = np.asarray(price, dtype=float)
+    carbon = np.asarray(carbon, dtype=float)
+    carbon_tonnes = carbon / MASS_PER_TONNE[carbon_units]
+    if carbon_prices is None:
+        carbon_prices = default_carbon_prices(price, carbon_tonnes, n=n_points)
+    carbon_prices = np.asarray(carbon_prices, dtype=float)
+
+    common = dict(
+        dt=dt, power_mw=power_mw, power_discharge_mw=power_discharge_mw,
+        energy_mwh=energy_mwh, rte=rte, soc_init=soc_init, soc_min=soc_min,
+        cycle_cost=cycle_cost, terminal_soc=terminal_soc,
+        guard_simultaneous=guard_simultaneous,
+    )
+
+    base = solve_dispatch(price, **common)
+    base_m = evaluate(base, price, carbon_tonnes, dt, energy_mwh)
+
+    abated, foregone, net_emissions = [], [], []
+    for cp in carbon_prices:
+        disp = solve_dispatch(price + cp * carbon_tonnes, **common)
+        m = evaluate(disp, price, carbon_tonnes, dt, energy_mwh)
+        abated.append(base_m.net_emissions_tonnes - m.net_emissions_tonnes)
+        foregone.append(base_m.revenue - m.revenue)
+        net_emissions.append(m.net_emissions_tonnes)
+
+    abated = np.asarray(abated)
+    foregone = np.asarray(foregone)
+    # Marginal $/tonne between consecutive sweep points (sorted by abatement).
+    order = np.argsort(abated)
+    a_s, f_s = abated[order], foregone[order]
+    d_a = np.diff(a_s)
+    marginal = np.where(np.abs(d_a) > _TOL, np.diff(f_s) / np.where(d_a == 0, np.nan, d_a), np.nan)
+
+    baseline_avoided = -base_m.net_emissions_tonnes
+    max_avoided = -min(net_emissions)          # most-negative net emissions = most avoided
+    capture = baseline_avoided / max_avoided if abs(max_avoided) > _TOL else float("nan")
+
+    return Frontier(
+        carbon_prices=carbon_prices,
+        tonnes_abated=abated,
+        revenue_foregone=foregone,
+        marginal_cost=marginal,
+        baseline_avoided_tonnes=baseline_avoided,
+        max_avoided_tonnes=max_avoided,
+        capture_fraction=capture,
+    )
+
+
+def signal_alignment(price, carbon, dispatch=None):
+    """Rank/level correlation between the price and carbon signals.
+
+    Spearman (rank) is the headline: dispatch is about *ordering* intervals, and
+    rank correlation is robust to price spikes. If ``dispatch`` is given, also report
+    the correlation over just the intervals the battery actually uses -- the
+    alignment it experiences (tails matter more than the whole distribution).
+    """
+    price = np.asarray(price, dtype=float)
+    carbon = np.asarray(carbon, dtype=float)
+    out = {
+        "spearman": float(spearmanr(price, carbon).statistic),
+        "pearson": float(np.corrcoef(price, carbon)[0, 1]),
+        "spearman_active": float("nan"),
+    }
+    if dispatch is not None:
+        active = (dispatch.charge_mw > _TOL) | (dispatch.discharge_mw > _TOL)
+        if int(active.sum()) > 2:
+            out["spearman_active"] = float(spearmanr(price[active], carbon[active]).statistic)
+    return out
 
 
 def infer_dt_hours(timestamps):

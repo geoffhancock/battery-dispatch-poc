@@ -9,9 +9,12 @@ import numpy as np
 
 from dispatch_core import (
     MASS_PER_TONNE,
+    abatement_frontier,
+    default_carbon_prices,
     evaluate,
     infer_dt_hours,
     run_comparison,
+    signal_alignment,
     solve_dispatch,
 )
 
@@ -116,6 +119,35 @@ def test_asymmetric_power_limits():
     assert sym.discharge_mw.max() > 3.0 + 1e-3      # symmetric would discharge faster
     assert asy.discharge_mw.max() <= 3.0 + 1e-4     # asymmetric discharge cap binds
     assert asy.charge_mw.max() <= 10.0 + 1e-4       # charge still allowed up to 10
+
+
+def test_abatement_frontier_monotone():
+    fr = abatement_frontier(PRICE, CARBON, dt=1.0, carbon_units="lbs/MWh",
+                            n_points=8, **PARAMS)
+    # More carbon price -> at least as much abatement and at least as much cost.
+    assert np.all(np.diff(fr.tonnes_abated) >= -1e-6)
+    assert np.all(np.diff(fr.revenue_foregone) >= -1e-6)
+    # First sweep point is carbon_price=0 -> no abatement, no cost.
+    assert abs(fr.tonnes_abated[0]) < 1e-6 and abs(fr.revenue_foregone[0]) < 1e-6
+    # Price-only captures between 0 and 100% of the max avoidable CO2.
+    if not np.isnan(fr.capture_fraction):
+        assert -1e-6 <= fr.capture_fraction <= 1 + 1e-6
+    # Marginal cost is one shorter than the number of points.
+    assert fr.marginal_cost.size == fr.carbon_prices.size - 1
+
+
+def test_signal_alignment():
+    a = signal_alignment(PRICE, CARBON)
+    assert -1.0 <= a["spearman"] <= 1.0
+    assert -1.0 <= a["pearson"] <= 1.0
+    # Perfectly monotonic signals -> Spearman == 1.
+    perfect = signal_alignment(np.arange(10.0), 2 * np.arange(10.0) + 3)
+    assert abs(perfect["spearman"] - 1.0) < 1e-9
+
+
+def test_default_carbon_prices():
+    cps = default_carbon_prices(PRICE, CARBON / MASS_PER_TONNE["lbs/MWh"], n=6)
+    assert cps.size == 6 and cps[0] == 0.0 and cps[-1] > 0
 
 
 def test_infer_dt():
