@@ -94,6 +94,30 @@ def test_zero_carbon_price_matches_baseline():
     assert abs(comp.tonnes_abated) < 1e-6
 
 
+def test_nonfinite_signal_raises():
+    sig = PRICE.copy()
+    sig[3] = np.nan
+    try:
+        solve_dispatch(sig, dt=1.0, **PARAMS)
+    except ValueError as e:
+        assert "non-finite" in str(e)
+    else:
+        raise AssertionError("expected ValueError on a NaN signal")
+
+
+def test_asymmetric_power_limits():
+    """A tighter discharge cap must bind while the charge cap stays higher."""
+    sym = solve_dispatch(PRICE, dt=1.0, power_mw=10.0, energy_mwh=40.0, rte=0.85,
+                         soc_init=0.0, soc_min=0.0, terminal_soc=True)
+    asy = solve_dispatch(PRICE, dt=1.0, power_mw=10.0, power_discharge_mw=3.0,
+                         energy_mwh=40.0, rte=0.85, soc_init=0.0, soc_min=0.0,
+                         terminal_soc=True)
+    assert asy.success
+    assert sym.discharge_mw.max() > 3.0 + 1e-3      # symmetric would discharge faster
+    assert asy.discharge_mw.max() <= 3.0 + 1e-4     # asymmetric discharge cap binds
+    assert asy.charge_mw.max() <= 10.0 + 1e-4       # charge still allowed up to 10
+
+
 def test_infer_dt():
     ts = np.arange("2026-01-01T00:00", "2026-01-02T00:00",
                    np.timedelta64(1, "h"), dtype="datetime64[m]")

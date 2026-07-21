@@ -104,6 +104,7 @@ def solve_dispatch(
     cycle_cost=0.0,
     terminal_soc=True,
     guard_simultaneous=True,
+    power_discharge_mw=None,
 ):
     """Optimize battery dispatch against ``signal`` ($/MWh) under perfect foresight.
 
@@ -111,11 +112,14 @@ def solve_dispatch(
     ----------
     signal : array-like
         Effective per-interval objective coefficient in $/MWh. Discharging earns
-        ``signal_t``; charging pays it.
+        ``signal_t``; charging pays it. Must be all-finite (no NaN/inf).
     dt : float
         Interval length in hours (e.g. 1.0 hourly, 0.0833... for 5-minute).
     power_mw, energy_mwh, rte : float
-        Battery power (MW), usable energy (MWh), and round-trip efficiency (0-1).
+        Charge power limit (MW), usable energy (MWh), and round-trip efficiency (0-1).
+    power_discharge_mw : float or None
+        Discharge power limit (MW). If None, the battery is symmetric and the
+        discharge limit equals ``power_mw``.
     soc_init, soc_min : float
         Initial and minimum state of charge in MWh.
     cycle_cost : float
@@ -135,15 +139,21 @@ def solve_dispatch(
     n = signal.size
     if n == 0:
         raise ValueError("signal is empty")
+    if not np.all(np.isfinite(signal)):
+        raise ValueError(
+            f"signal contains {int(np.sum(~np.isfinite(signal)))} non-finite "
+            "value(s) (NaN/inf); clean the input before solving"
+        )
     if not (0.0 < rte <= 1.0):
         raise ValueError(f"rte must be in (0, 1], got {rte}")
-    if energy_mwh <= 0 or power_mw <= 0:
-        raise ValueError("power_mw and energy_mwh must be positive")
+    P_c = float(power_mw)
+    P_d = float(power_mw if power_discharge_mw is None else power_discharge_mw)
+    if energy_mwh <= 0 or P_c <= 0 or P_d <= 0:
+        raise ValueError("charge/discharge power and energy_mwh must be positive")
     if not (soc_min <= soc_init <= energy_mwh):
         raise ValueError("require soc_min <= soc_init <= energy_mwh")
 
     eta = np.sqrt(rte)
-    P = float(power_mw)
 
     # Variable layout: [c_0..c_{n-1}, d_0..d_{n-1}, soc_0..soc_{n-1}, z_0..z_{k-1}]
     ci = np.arange(n)                 # charge columns
@@ -182,12 +192,12 @@ def solve_dispatch(
         grows, gcols, gdata = [], [], []
         gub = np.empty(2 * k)
         for j, t in enumerate(guarded):
-            # c_t - P*z_j <= 0
-            grows += [j, j]; gcols += [int(ci[t]), int(zi[j])]; gdata += [1.0, -P]
+            # c_t - P_c*z_j <= 0
+            grows += [j, j]; gcols += [int(ci[t]), int(zi[j])]; gdata += [1.0, -P_c]
             gub[j] = 0.0
-            # d_t + P*z_j <= P
-            grows += [k + j, k + j]; gcols += [int(di[t]), int(zi[j])]; gdata += [1.0, P]
-            gub[k + j] = P
+            # d_t + P_d*z_j <= P_d
+            grows += [k + j, k + j]; gcols += [int(di[t]), int(zi[j])]; gdata += [1.0, P_d]
+            gub[k + j] = P_d
         A_g = coo_matrix((gdata, (grows, gcols)), shape=(2 * k, n_vars))
         con_g = LinearConstraint(A_g, -np.inf, gub)
         constraints.append(con_g)
@@ -195,8 +205,8 @@ def solve_dispatch(
     # ---- Bounds
     lb = np.zeros(n_vars)
     ub = np.empty(n_vars)
-    ub[ci] = P
-    ub[di] = P
+    ub[ci] = P_c
+    ub[di] = P_d
     lb[si] = soc_min
     ub[si] = energy_mwh
     if terminal_soc:
@@ -281,6 +291,7 @@ def run_comparison(
     rte,
     carbon_price_per_tonne,
     carbon_units="lbs/MWh",
+    power_discharge_mw=None,
     soc_init=0.0,
     soc_min=0.0,
     cycle_cost=0.0,
@@ -304,7 +315,8 @@ def run_comparison(
     carbon_tonnes = carbon / MASS_PER_TONNE[carbon_units]
 
     common = dict(
-        dt=dt, power_mw=power_mw, energy_mwh=energy_mwh, rte=rte,
+        dt=dt, power_mw=power_mw, power_discharge_mw=power_discharge_mw,
+        energy_mwh=energy_mwh, rte=rte,
         soc_init=soc_init, soc_min=soc_min, cycle_cost=cycle_cost,
         terminal_soc=terminal_soc, guard_simultaneous=guard_simultaneous,
     )

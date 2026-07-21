@@ -34,12 +34,13 @@ def load_sample():
 
 
 @st.cache_data(show_spinner=False)
-def cached_run(price, carbon, dt, power_mw, energy_mwh, rte, carbon_price,
-               carbon_units, soc_init, soc_min, cycle_cost, terminal_soc):
+def cached_run(price, carbon, dt, power_mw, power_discharge_mw, energy_mwh, rte,
+               carbon_price, carbon_units, soc_init, soc_min, cycle_cost, terminal_soc):
     """Cache solves keyed on the signal arrays + all parameters."""
     return run_comparison(
         price, carbon, dt,
-        power_mw=power_mw, energy_mwh=energy_mwh, rte=rte,
+        power_mw=power_mw, power_discharge_mw=power_discharge_mw,
+        energy_mwh=energy_mwh, rte=rte,
         carbon_price_per_tonne=carbon_price, carbon_units=carbon_units,
         soc_init=soc_init, soc_min=soc_min, cycle_cost=cycle_cost,
         terminal_soc=terminal_soc,
@@ -126,14 +127,40 @@ if irregular:
     st.warning("Irregular timestamp gaps detected (>1% from median). The solver assumes a "
                "uniform interval; results may be off if gaps are real.")
 
-price = df[price_col].to_numpy(dtype=float)
-carbon = df[carbon_col].to_numpy(dtype=float)
+# Coerce to numeric (stray text -> NaN) and handle gaps: real LMP/MOER exports
+# routinely have missing intervals, and the solver needs a gap-free finite series.
+price_raw = pd.to_numeric(df[price_col], errors="coerce").to_numpy(dtype=float)
+carbon_raw = pd.to_numeric(df[carbon_col], errors="coerce").to_numpy(dtype=float)
+n_bad_p = int(np.sum(~np.isfinite(price_raw)))
+n_bad_c = int(np.sum(~np.isfinite(carbon_raw)))
+
+if n_bad_p or n_bad_c:
+    st.warning(f"Missing/non-numeric values found: **{n_bad_p}** in '{price_col}', "
+               f"**{n_bad_c}** in '{carbon_col}'. The solver needs a gap-free series.")
+    fix = st.radio("Handle them by:",
+                   ["Linear-interpolate gaps", "Stop (I'll fix the file)"], horizontal=True)
+    if fix.startswith("Stop"):
+        st.stop()
+    price = pd.Series(price_raw).interpolate(limit_direction="both").bfill().ffill().to_numpy()
+    carbon = pd.Series(carbon_raw).interpolate(limit_direction="both").bfill().ffill().to_numpy()
+    if not (np.all(np.isfinite(price)) and np.all(np.isfinite(carbon))):
+        st.error("A selected column is entirely empty after coercion — pick a numeric column.")
+        st.stop()
+    st.caption(f"Filled {n_bad_p + n_bad_c} value(s) by linear interpolation.")
+else:
+    price, carbon = price_raw, carbon_raw
 
 # --------------------------------------------------------------------------- #
 # Parameters (sidebar)
 # --------------------------------------------------------------------------- #
 st.sidebar.header("Battery")
-power_mw = st.sidebar.number_input("Power (MW)", value=10.0, min_value=0.01)
+asymmetric = st.sidebar.checkbox("Different charge vs discharge power", value=False)
+if asymmetric:
+    power_mw = st.sidebar.number_input("Max charge power (MW)", value=10.0, min_value=0.01)
+    power_discharge_mw = st.sidebar.number_input("Max discharge power (MW)", value=10.0, min_value=0.01)
+else:
+    power_mw = st.sidebar.number_input("Power (MW)", value=10.0, min_value=0.01)
+    power_discharge_mw = None
 energy_mwh = st.sidebar.number_input("Usable energy (MWh)", value=40.0, min_value=0.01)
 rte_pct = st.sidebar.slider("Round-trip efficiency (%)", 50, 100, 85)
 soc_init_pct = st.sidebar.slider("Initial SOC (% of energy)", 0, 100, 0)
@@ -166,7 +193,7 @@ if not run:
 with st.spinner("Solving baseline and carbon-aware dispatch..."):
     comp = cached_run(
         price, carbon, dt_hours,
-        power_mw, energy_mwh, rte_pct / 100.0,
+        power_mw, power_discharge_mw, energy_mwh, rte_pct / 100.0,
         carbon_price, carbon_units, soc_init, soc_min, cycle_cost, terminal_soc,
     )
 
