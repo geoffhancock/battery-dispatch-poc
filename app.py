@@ -209,8 +209,12 @@ if soc_init < soc_min:
 # --------------------------------------------------------------------------- #
 # Solve
 # --------------------------------------------------------------------------- #
-run = st.button("Run dispatch", type="primary")
-if not run:
+# Latch the run state: st.button is True only on the click's rerun, so any later
+# widget interaction (e.g. a carpet radio) would otherwise re-hide the results.
+if st.button("Run dispatch", type="primary"):
+    st.session_state["has_run"] = True
+if not st.session_state.get("has_run"):
+    st.info("Set parameters in the sidebar and click **Run dispatch**.")
     st.stop()
 
 with st.spinner("Solving baseline and carbon-aware dispatch..."):
