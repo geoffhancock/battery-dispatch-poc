@@ -1,0 +1,9 @@
+# WattTime brand-aligned theme (see BRAND.md).
+# Note: Lexend Deca / Poppins are not bundled with Streamlit; the app falls back
+# to the default sans-serif. Load the brand fonts before publishing externally.
+[theme]
+base = "light"
+backgroundColor = "#f6f6f6"
+secondaryBackgroundColor = "#ffffff"
+textColor = "#000000"
+primaryColor = "#83c341"

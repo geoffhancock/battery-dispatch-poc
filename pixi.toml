@@ -1,0 +1,19 @@
+[project]
+name = "battery-dispatch-poc"
+version = "0.1.0"
+description = "Perfect-foresight battery dispatch solver (Streamlit) with price + carbon co-optimization"
+channels = ["conda-forge"]
+platforms = ["win-64", "linux-64"]
+
+[dependencies]
+python = ">=3.11"
+numpy = ">=1.24"
+pandas = ">=2.0"
+scipy = ">=1.11"
+plotly = ">=5.18"
+streamlit = ">=1.30"
+pytest = ">=7.0"
+
+[tasks]
+test = "pytest test_solver.py"
+app = "streamlit run app.py"

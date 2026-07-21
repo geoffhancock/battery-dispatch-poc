@@ -1,0 +1,11 @@
+# pixi
+.pixi/
+*.egg-info/
+
+# python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# streamlit
+.streamlit/secrets.toml

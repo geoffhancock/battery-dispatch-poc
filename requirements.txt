@@ -1,0 +1,10 @@
+# Runtime deps for Streamlit Community Cloud / Hugging Face Spaces.
+# Pinned to the versions this MVP was built and tested against (conda/py3.14 locally).
+# On Streamlit Community Cloud, select Python 3.13 in the app's Advanced settings
+# (3.14 may not be offered yet); the code uses no 3.14-only features.
+# If Cloud's pip resolver rejects a pin, relax that line to a compatible range.
+streamlit==1.59.2
+pandas==3.0.3
+numpy==2.5.1
+scipy==1.18.0          # scipy.optimize.milp (HiGHS) requires >=1.11
+plotly==6.9.0
