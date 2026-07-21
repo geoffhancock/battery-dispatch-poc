@@ -369,9 +369,14 @@ class Frontier:
     capture_fraction: float            # baseline_avoided / max_avoided
 
 
-def default_carbon_prices(price, carbon_tonnes_per_mwh, n=10, headroom=8.0):
+def default_carbon_prices(price, carbon_tonnes_per_mwh, n=10, headroom=8.0, skew=2.0):
     """A carbon-price sweep wide enough to push dispatch from price-optimal to
-    carbon-optimal. Uses robust (5th-95th pct) spans so spikes don't blow it up."""
+    carbon-optimal. Uses robust (5th-95th pct) spans so spikes don't blow it up.
+
+    Points are packed toward zero (``skew`` > 1 => quadratic-ish spacing) because
+    the low-carbon-price / low-revenue-loss region is where the tradeoff curves
+    vary most and where operators actually want to explore.
+    """
     price = np.asarray(price, dtype=float)
     carbon = np.asarray(carbon_tonnes_per_mwh, dtype=float)
     p_span = np.percentile(price, 95) - np.percentile(price, 5)
@@ -379,7 +384,8 @@ def default_carbon_prices(price, carbon_tonnes_per_mwh, n=10, headroom=8.0):
     if c_span <= 0:
         c_span = abs(np.mean(carbon)) or 1.0
     lam_max = headroom * (p_span if p_span > 0 else abs(np.mean(price)) or 1.0) / c_span
-    return np.linspace(0.0, lam_max, n)
+    t = np.linspace(0.0, 1.0, n)
+    return lam_max * t ** skew
 
 
 def abatement_frontier(

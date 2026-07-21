@@ -384,10 +384,6 @@ else:
     if not np.isnan(cur):
         fig_mac.add_vline(x=cur, line=dict(color=PRICE_COLOR, dash="dot"),
                           annotation_text=f"current ${cur:,.0f}/t", annotation_position="top")
-    # Annotate the LMP-only (free) endpoint == metric #3.
-    fig_mac.add_annotation(x=0, y=fr.capture_fraction * 100, yref="y2",
-                           text=f"LMP-only = {fr.capture_fraction * 100:.0f}% (metric #3)",
-                           showarrow=True, arrowhead=2, ax=55, ay=-25)
 
     # Share one 0-100% grid across both axes so gridlines align (both are percentages).
     allv = np.concatenate([y_rev, y_co2])
