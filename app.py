@@ -240,9 +240,9 @@ h1.metric("Realized abatement cost",
           help="Revenue foregone divided by tonnes abated. The number that actually "
                "informs a decision (the carbon-price input is arbitrary).")
 h2.metric("CO2 abated", f"{comp.tonnes_abated:,.1f} tonnes",
-          help="Baseline net emissions minus carbon-aware net emissions.")
+          help="LMP net emissions minus LMP+CO2 net emissions.")
 h3.metric("Revenue foregone", f"${comp.revenue_foregone:,.0f}",
-          help="Baseline revenue minus carbon-aware revenue.")
+          help="LMP revenue minus LMP+CO2 revenue.")
 
 # --------------------------------------------------------------------------- #
 # Comparison table
@@ -250,15 +250,15 @@ h3.metric("Revenue foregone", f"${comp.revenue_foregone:,.0f}",
 bm, cm = comp.baseline_metrics, comp.carbon_aware_metrics
 table = pd.DataFrame(
     {
-        "Baseline (price only)": [bm.revenue, bm.net_emissions_tonnes, bm.equiv_cycles,
-                                  bm.mwh_discharged, bm.simultaneous_intervals],
-        "Carbon-aware": [cm.revenue, cm.net_emissions_tonnes, cm.equiv_cycles,
-                         cm.mwh_discharged, cm.simultaneous_intervals],
+        "LMP (price only)": [bm.revenue, bm.net_emissions_tonnes, bm.equiv_cycles,
+                             bm.mwh_discharged, bm.simultaneous_intervals],
+        "LMP+CO2": [cm.revenue, cm.net_emissions_tonnes, cm.equiv_cycles,
+                    cm.mwh_discharged, cm.simultaneous_intervals],
     },
     index=["Revenue ($)", "Net emissions (tonnes CO2)", "Equivalent full cycles",
            "MWh discharged", "Simultaneous charge+discharge intervals"],
 )
-st.dataframe(table.style.format({"Baseline (price only)": "{:,.2f}", "Carbon-aware": "{:,.2f}"}),
+st.dataframe(table.style.format({"LMP (price only)": "{:,.2f}", "LMP+CO2": "{:,.2f}"}),
              width="stretch")
 
 # Data-quality tripwires
@@ -277,22 +277,22 @@ st.caption("Data-quality: " + " · ".join(notes))
 x = ts if ts_choice != "(none / set interval manually)" else np.arange(len(df))
 fig = make_subplots(
     rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.06,
-    subplot_titles=("Signal ($/MWh): price vs carbon-aware effective signal",
+    subplot_titles=("Signal ($/MWh): LMP vs LMP+CO2 effective signal",
                     "Net dispatch (MW, + = discharge)", "State of charge (MWh)"),
 )
-# Panel 1: price and the effective carbon-aware signal (both $/MWh)
-fig.add_trace(go.Scatter(x=x, y=comp.price, name="Price (LMP)", line=dict(color=PRICE_COLOR)), row=1, col=1)
-fig.add_trace(go.Scatter(x=x, y=comp.carbon_aware_signal, name="Carbon-aware signal",
+# Panel 1: price and the effective LMP+CO2 signal (both $/MWh)
+fig.add_trace(go.Scatter(x=x, y=comp.price, name="LMP", line=dict(color=PRICE_COLOR)), row=1, col=1)
+fig.add_trace(go.Scatter(x=x, y=comp.carbon_aware_signal, name="LMP+CO2 signal",
                          line=dict(color=CARBON_COLOR)), row=1, col=1)
 # Panel 2: net dispatch
 fig.add_trace(go.Scatter(x=x, y=comp.baseline.discharge_mw - comp.baseline.charge_mw,
-                         name="Baseline dispatch", line=dict(color=BASELINE_COLOR)), row=2, col=1)
+                         name="LMP dispatch", line=dict(color=BASELINE_COLOR)), row=2, col=1)
 fig.add_trace(go.Scatter(x=x, y=comp.carbon_aware.discharge_mw - comp.carbon_aware.charge_mw,
-                         name="Carbon-aware dispatch", line=dict(color=CARBON_COLOR)), row=2, col=1)
+                         name="LMP+CO2 dispatch", line=dict(color=CARBON_COLOR)), row=2, col=1)
 # Panel 3: SOC
-fig.add_trace(go.Scatter(x=x, y=comp.baseline.soc_mwh, name="Baseline SOC",
+fig.add_trace(go.Scatter(x=x, y=comp.baseline.soc_mwh, name="LMP SOC",
                          line=dict(color=BASELINE_COLOR)), row=3, col=1)
-fig.add_trace(go.Scatter(x=x, y=comp.carbon_aware.soc_mwh, name="Carbon-aware SOC",
+fig.add_trace(go.Scatter(x=x, y=comp.carbon_aware.soc_mwh, name="LMP+CO2 SOC",
                          line=dict(color=CARBON_COLOR)), row=3, col=1)
 fig.update_layout(height=750, plot_bgcolor=BG, paper_bgcolor=BG,
                   legend=dict(orientation="h", y=-0.08), margin=dict(t=40, b=40))
@@ -318,55 +318,72 @@ g2.metric("Alignment in used hours", "n/a" if np.isnan(align["spearman_active"])
           else f"{align['spearman_active']:+.2f}",
           help="Spearman restricted to the intervals the battery actually charges/discharges "
                "-- the alignment it experiences. Tails matter more than the whole distribution.")
-g3.metric("CO2 price-only captures",
+g3.metric("% of max CO2 capture by LMP dispatch",
           "n/a" if np.isnan(fr.capture_fraction) else f"{fr.capture_fraction * 100:,.0f}%",
-          help="Share of the maximum avoidable CO2 that price-only dispatch already gets "
-               "for free (zero revenue cost).")
+          help="Share of the maximum avoidable CO2 that the LMP (price-only) dispatch already "
+               "gets for free (zero revenue cost). Low = price and carbon are weakly aligned, "
+               "so most of the abatement is left on the table.")
 
-# Scatter: price vs carbon, colored by hour-of-day if available
+# Scatter: price vs carbon, colored by what the LMP dispatch does, so the tails
+# (the only intervals a power/energy-limited battery acts on) stand out.
 has_ts = ts_choice != "(none / set interval manually)"
-hod = pd.to_datetime(df[ts_choice]).dt.hour if has_ts else np.zeros(len(price))
-sc = go.Figure(go.Scatter(
-    x=price, y=carbon, mode="markers",
-    marker=dict(size=5, color=hod, colorscale="Twilight", showscale=has_ts,
-                colorbar=dict(title="hour") if has_ts else None, opacity=0.6),
-))
-sc.update_layout(height=360, plot_bgcolor=BG, paper_bgcolor=BG,
+b = comp.baseline
+is_charge = b.charge_mw > 1e-6
+is_discharge = b.discharge_mw > 1e-6
+is_idle = ~(is_charge | is_discharge)
+sc = go.Figure()
+sc.add_trace(go.Scatter(x=price[is_idle], y=carbon[is_idle], mode="markers", name="Idle",
+                        marker=dict(size=4, color="#cccccc", opacity=0.25)))
+sc.add_trace(go.Scatter(x=price[is_charge], y=carbon[is_charge], mode="markers",
+                        name="LMP charges (cheap hrs)",
+                        marker=dict(size=7, color="#aadee8", opacity=0.85)))
+sc.add_trace(go.Scatter(x=price[is_discharge], y=carbon[is_discharge], mode="markers",
+                        name="LMP discharges (dear hrs)",
+                        marker=dict(size=7, color="#83c341", opacity=0.85)))
+sc.update_layout(height=400, plot_bgcolor=BG, paper_bgcolor=BG,
                  xaxis_title=f"Price ({price_col})", yaxis_title=f"Carbon ({carbon_col})",
-                 margin=dict(t=30, b=40),
-                 title=f"Each point = one interval  ·  Spearman {align['spearman']:+.2f}")
+                 legend=dict(orientation="h", y=-0.2), margin=dict(t=30, b=40),
+                 title=f"Colored by what LMP dispatch does  ·  Spearman {align['spearman']:+.2f}")
 st.plotly_chart(sc, width="stretch")
+st.caption("Strong alignment puts the **charge** points (cheap hours) low on the carbon axis and "
+           "**discharge** points (dear hours) high. Charge/discharge colors smeared across the "
+           "carbon range = weak alignment: LMP dispatch lands on clean and dirty hours alike.")
 
 # --------------------------------------------------------------------------- #
 # Abatement cost curve
 # --------------------------------------------------------------------------- #
-st.subheader("4. Abatement cost curve")
-tonnes = fr.tonnes_abated
-mask = tonnes > 1e-9
-avg_cost = np.full_like(tonnes, np.nan)
-avg_cost[mask] = fr.revenue_foregone[mask] / tonnes[mask]
+st.subheader("4. Revenue vs CO2 tradeoff")
+cp_x = fr.carbon_prices
+pct_rev = 100 * fr.revenue / fr.baseline_revenue if abs(fr.baseline_revenue) > 1e-9 else None
+pct_co2 = 100 * fr.avoided_tonnes / fr.max_avoided_tonnes if abs(fr.max_avoided_tonnes) > 1e-9 else None
 
-fig_mac = go.Figure()
-fig_mac.add_trace(go.Scatter(x=tonnes, y=avg_cost, mode="lines+markers",
-                             name="Average $/tonne", line=dict(color=CARBON_COLOR)))
-fig_mac.add_trace(go.Scatter(x=tonnes[1:], y=fr.marginal_cost, mode="lines",
-                             name="Marginal $/tonne (MAC)",
-                             line=dict(color=BASELINE_COLOR, dash="dash")))
-if not np.isnan(comp.abatement_cost_per_tonne):
-    fig_mac.add_trace(go.Scatter(
-        x=[comp.tonnes_abated], y=[comp.abatement_cost_per_tonne], mode="markers",
-        name=f"Current (@ ${carbon_price:,.0f}/t)",
-        marker=dict(size=13, color=PRICE_COLOR, symbol="x")))
-fig_mac.update_layout(height=380, plot_bgcolor=BG, paper_bgcolor=BG,
-                      xaxis_title="Additional CO2 abated beyond price-only (tonnes)",
-                      yaxis_title="Cost ($/tonne)", legend=dict(orientation="h", y=-0.2),
-                      margin=dict(t=30, b=40))
+fig_mac = make_subplots(specs=[[{"secondary_y": True}]])
+if pct_rev is not None:
+    fig_mac.add_trace(go.Scatter(x=cp_x, y=pct_rev, name="% of max revenue",
+                                 mode="lines+markers", line=dict(color=BASELINE_COLOR)),
+                      secondary_y=False)
+if pct_co2 is not None:
+    fig_mac.add_trace(go.Scatter(x=cp_x, y=pct_co2, name="% of optimal CO2",
+                                 mode="lines+markers", line=dict(color=CARBON_COLOR)),
+                      secondary_y=True)
+fig_mac.add_vline(x=carbon_price, line=dict(color=PRICE_COLOR, dash="dot"),
+                  annotation_text=f"current ${carbon_price:,.0f}/t", annotation_position="top")
+fig_mac.update_xaxes(title_text="Marginal abatement cost ($/tonne CO2)")
+fig_mac.update_yaxes(title_text="% of max revenue", secondary_y=False, color=BASELINE_COLOR)
+fig_mac.update_yaxes(title_text="% of optimal CO2", secondary_y=True, color=CARBON_COLOR)
+fig_mac.update_layout(height=400, plot_bgcolor=BG, paper_bgcolor=BG,
+                      legend=dict(orientation="h", y=-0.2), margin=dict(t=30, b=40))
 st.plotly_chart(fig_mac, width="stretch")
-if tonnes.max() > 1e-9:
+if pct_rev is None or pct_co2 is None:
+    st.caption("Tradeoff curve unavailable: this scenario has ~zero max revenue or ~zero "
+               "avoidable CO2, so the percentages are undefined.")
+else:
     st.caption(
-        f"Beyond the price-only dispatch, up to **{tonnes.max():,.0f} more tonnes** of CO2 "
-        f"can be abated; the final increment costs ~**${np.nanmax(fr.marginal_cost):,.0f}/tonne**. "
-        "The curve steepens as you push from price-optimal toward carbon-optimal."
+        "As the marginal abatement cost (x, your willingness-to-pay per tonne) rises, the "
+        "battery keeps **less of its max arbitrage revenue** (grey, left axis) to capture "
+        "**more of the avoidable CO2** (green, right axis). Both axes are % of their own optimum "
+        "(100% revenue = LMP-only dispatch; 100% CO2 = carbon-optimal dispatch). The knee is the "
+        "sweet spot; the dotted line marks your current carbon price."
     )
 
 # --------------------------------------------------------------------------- #
@@ -387,13 +404,13 @@ else:
 
     cc1, cc2 = st.columns(2)
     disp_choice = cc1.radio("Dispatch (MW, + = discharge)",
-                            ["Carbon-aware", "Baseline", "Difference (CA - Base)"])
-    sig_choice = cc2.radio("Signal", ["MOER", "LMP", "Carbon-aware signal"])
+                            ["LMP+CO2", "LMP", "Difference (LMP+CO2 - LMP)"])
+    sig_choice = cc2.radio("Signal", ["MOER", "LMP", "LMP+CO2 signal"])
 
-    disp_vals = {"Carbon-aware": ca_net, "Baseline": base_net,
-                 "Difference (CA - Base)": ca_net - base_net}[disp_choice]
+    disp_vals = {"LMP+CO2": ca_net, "LMP": base_net,
+                 "Difference (LMP+CO2 - LMP)": ca_net - base_net}[disp_choice]
     sig_vals = {"MOER": carbon, "LMP": price,
-                "Carbon-aware signal": comp.carbon_aware_signal}[sig_choice]
+                "LMP+CO2 signal": comp.carbon_aware_signal}[sig_choice]
 
     # All colors below are from the WattTime palette; MOER uses a deliberate
     # clean->dirty green/yellow/coal-red ramp (all documented palette colors).

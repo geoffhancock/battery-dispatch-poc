@@ -357,10 +357,13 @@ def run_comparison(
 class Frontier:
     """Marginal abatement cost curve: price-only -> carbon-max, swept over carbon price."""
 
-    carbon_prices: np.ndarray          # $/tonne swept
+    carbon_prices: np.ndarray          # $/tonne swept (== marginal abatement cost)
     tonnes_abated: np.ndarray          # cumulative, vs the price-only baseline
     revenue_foregone: np.ndarray       # cumulative $, vs the price-only baseline
     marginal_cost: np.ndarray          # $/tonne between consecutive points (len n-1)
+    revenue: np.ndarray                # absolute $ at each sweep point
+    avoided_tonnes: np.ndarray         # absolute CO2 avoided (vs idle) at each point
+    baseline_revenue: float            # revenue at carbon_price=0 (the max revenue)
     baseline_avoided_tonnes: float     # CO2 avoided by price-only dispatch (vs idle)
     max_avoided_tonnes: float          # CO2 avoided by the carbon-max dispatch
     capture_fraction: float            # baseline_avoided / max_avoided
@@ -422,16 +425,19 @@ def abatement_frontier(
     base = solve_dispatch(price, **common)
     base_m = evaluate(base, price, carbon_tonnes, dt, energy_mwh)
 
-    abated, foregone, net_emissions = [], [], []
+    abated, foregone, net_emissions, revenue = [], [], [], []
     for cp in carbon_prices:
         disp = solve_dispatch(price + cp * carbon_tonnes, **common)
         m = evaluate(disp, price, carbon_tonnes, dt, energy_mwh)
         abated.append(base_m.net_emissions_tonnes - m.net_emissions_tonnes)
         foregone.append(base_m.revenue - m.revenue)
         net_emissions.append(m.net_emissions_tonnes)
+        revenue.append(m.revenue)
 
     abated = np.asarray(abated)
     foregone = np.asarray(foregone)
+    revenue = np.asarray(revenue)
+    avoided_tonnes = -np.asarray(net_emissions)
     # Marginal $/tonne between consecutive sweep points (sorted by abatement).
     order = np.argsort(abated)
     a_s, f_s = abated[order], foregone[order]
@@ -447,6 +453,9 @@ def abatement_frontier(
         tonnes_abated=abated,
         revenue_foregone=foregone,
         marginal_cost=marginal,
+        revenue=revenue,
+        avoided_tonnes=avoided_tonnes,
+        baseline_revenue=base_m.revenue,
         baseline_avoided_tonnes=baseline_avoided,
         max_avoided_tonnes=max_avoided,
         capture_fraction=capture,
