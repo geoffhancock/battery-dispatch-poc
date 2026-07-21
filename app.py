@@ -241,8 +241,11 @@ h1.metric("Realized abatement cost",
                "informs a decision (the carbon-price input is arbitrary).")
 h2.metric("CO2 abated", f"{comp.tonnes_abated:,.1f} tonnes",
           help="LMP net emissions minus LMP+CO2 net emissions.")
-h3.metric("Revenue foregone", f"${comp.revenue_foregone:,.0f}",
-          help="LMP revenue minus LMP+CO2 revenue.")
+base_rev = comp.baseline_metrics.revenue
+rev_pct = (100 * comp.revenue_foregone / base_rev) if abs(base_rev) > 1e-9 else float("nan")
+h3.metric("Revenue foregone (%)",
+          f"${comp.revenue_foregone:,.0f}" + ("" if np.isnan(rev_pct) else f" ({rev_pct:.1f}%)"),
+          help="LMP revenue minus LMP+CO2 revenue; percent is of the max (LMP-only) revenue.")
 
 # --------------------------------------------------------------------------- #
 # Comparison table
@@ -353,37 +356,57 @@ st.caption("Strong alignment puts the **charge** points (cheap hours) low on the
 # Abatement cost curve
 # --------------------------------------------------------------------------- #
 st.subheader("4. Revenue vs CO2 tradeoff")
-cp_x = fr.carbon_prices
-pct_rev = 100 * fr.revenue / fr.baseline_revenue if abs(fr.baseline_revenue) > 1e-9 else None
-pct_co2 = 100 * fr.avoided_tonnes / fr.max_avoided_tonnes if abs(fr.max_avoided_tonnes) > 1e-9 else None
-
-fig_mac = make_subplots(specs=[[{"secondary_y": True}]])
-if pct_rev is not None:
-    fig_mac.add_trace(go.Scatter(x=cp_x, y=pct_rev, name="% of max revenue",
-                                 mode="lines+markers", line=dict(color=BASELINE_COLOR)),
-                      secondary_y=False)
-if pct_co2 is not None:
-    fig_mac.add_trace(go.Scatter(x=cp_x, y=pct_co2, name="% of optimal CO2",
-                                 mode="lines+markers", line=dict(color=CARBON_COLOR)),
-                      secondary_y=True)
-fig_mac.add_vline(x=carbon_price, line=dict(color=PRICE_COLOR, dash="dot"),
-                  annotation_text=f"current ${carbon_price:,.0f}/t", annotation_position="top")
-fig_mac.update_xaxes(title_text="Marginal abatement cost ($/tonne CO2)")
-fig_mac.update_yaxes(title_text="% of max revenue", secondary_y=False, color=BASELINE_COLOR)
-fig_mac.update_yaxes(title_text="% of optimal CO2", secondary_y=True, color=CARBON_COLOR)
-fig_mac.update_layout(height=400, plot_bgcolor=BG, paper_bgcolor=BG,
-                      legend=dict(orientation="h", y=-0.2), margin=dict(t=30, b=40))
-st.plotly_chart(fig_mac, width="stretch")
-if pct_rev is None or pct_co2 is None:
+if not (abs(fr.baseline_revenue) > 1e-9 and abs(fr.max_avoided_tonnes) > 1e-9):
     st.caption("Tradeoff curve unavailable: this scenario has ~zero max revenue or ~zero "
                "avoidable CO2, so the percentages are undefined.")
 else:
+    # x = REALIZED abatement cost = revenue foregone / tonnes abated (same definition
+    # as the headline metric). The carbon-price input only scales the signal and is
+    # NOT a cost, so we never put it on an axis. The x=0 point is the LMP-only
+    # dispatch (free) and equals metric #3.
+    with np.errstate(divide="ignore", invalid="ignore"):
+        realized_cost = np.where(fr.tonnes_abated > 1e-9,
+                                 fr.revenue_foregone / fr.tonnes_abated, 0.0)
+    y_rev = 100 * fr.revenue / fr.baseline_revenue
+    y_co2 = 100 * fr.avoided_tonnes / fr.max_avoided_tonnes
+    order = np.argsort(realized_cost)
+    xr, y_rev, y_co2 = realized_cost[order], y_rev[order], y_co2[order]
+
+    fig_mac = make_subplots(specs=[[{"secondary_y": True}]])
+    fig_mac.add_trace(go.Scatter(x=xr, y=y_rev, name="% of max revenue",
+                                 mode="lines+markers", line=dict(color=BASELINE_COLOR)),
+                      secondary_y=False)
+    fig_mac.add_trace(go.Scatter(x=xr, y=y_co2, name="% of optimal CO2",
+                                 mode="lines+markers", line=dict(color=CARBON_COLOR)),
+                      secondary_y=True)
+    # Current operating point (realized cost at the current carbon price).
+    cur = comp.abatement_cost_per_tonne
+    if not np.isnan(cur):
+        fig_mac.add_vline(x=cur, line=dict(color=PRICE_COLOR, dash="dot"),
+                          annotation_text=f"current ${cur:,.0f}/t", annotation_position="top")
+    # Annotate the LMP-only (free) endpoint == metric #3.
+    fig_mac.add_annotation(x=0, y=fr.capture_fraction * 100, yref="y2",
+                           text=f"LMP-only = {fr.capture_fraction * 100:.0f}% (metric #3)",
+                           showarrow=True, arrowhead=2, ax=55, ay=-25)
+
+    # Share one 0-100% grid across both axes so gridlines align (both are percentages).
+    allv = np.concatenate([y_rev, y_co2])
+    lo = min(0.0, np.floor(np.nanmin(allv) / 25) * 25)
+    hi = max(100.0, np.ceil(np.nanmax(allv) / 25) * 25)
+    fig_mac.update_xaxes(title_text="Realized abatement cost ($/tonne CO2)")
+    fig_mac.update_yaxes(title_text="% of max revenue", secondary_y=False,
+                         color=BASELINE_COLOR, range=[lo, hi], dtick=25)
+    fig_mac.update_yaxes(title_text="% of optimal CO2", secondary_y=True,
+                         color=CARBON_COLOR, range=[lo, hi], dtick=25, showgrid=False)
+    fig_mac.update_layout(height=420, plot_bgcolor=BG, paper_bgcolor=BG,
+                          legend=dict(orientation="h", y=-0.2), margin=dict(t=40, b=40))
+    st.plotly_chart(fig_mac, width="stretch")
     st.caption(
-        "As the marginal abatement cost (x, your willingness-to-pay per tonne) rises, the "
-        "battery keeps **less of its max arbitrage revenue** (grey, left axis) to capture "
-        "**more of the avoidable CO2** (green, right axis). Both axes are % of their own optimum "
-        "(100% revenue = LMP-only dispatch; 100% CO2 = carbon-optimal dispatch). The knee is the "
-        "sweet spot; the dotted line marks your current carbon price."
+        "x = **realized** abatement cost (revenue foregone / tonnes abated -- the actual $/tonne, "
+        "not the carbon-price input, which only scales the signal). Grey (left) = % of max "
+        "(LMP-only) revenue kept; green (right) = % of the carbon-optimal CO2 captured. The "
+        "**x=0 endpoint is metric #3** (LMP-only, free); the dotted line is your current operating "
+        "point. Both axes share one 0-100% grid."
     )
 
 # --------------------------------------------------------------------------- #
