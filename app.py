@@ -363,10 +363,10 @@ sc.add_trace(go.Scatter(x=price[is_idle], y=carbon[is_idle], mode="markers", nam
                         marker=dict(size=4, color="#cccccc", opacity=0.25)))
 sc.add_trace(go.Scatter(x=price[is_charge], y=carbon[is_charge], mode="markers",
                         name="LMP charges (cheap hrs)",
-                        marker=dict(size=7, color="#aadee8", opacity=0.85)))
+                        marker=dict(size=7, color="#aadee8", opacity=0.45)))
 sc.add_trace(go.Scatter(x=price[is_discharge], y=carbon[is_discharge], mode="markers",
                         name="LMP discharges (dear hrs)",
-                        marker=dict(size=7, color="#83c341", opacity=0.85)))
+                        marker=dict(size=7, color="#83c341", opacity=0.45)))
 sc.update_layout(height=400, plot_bgcolor=BG, paper_bgcolor=BG,
                  xaxis_title=f"Price ({price_col})", yaxis_title=f"Carbon ({carbon_col})",
                  legend=dict(orientation="h", y=-0.2), margin=dict(t=30, b=40),
@@ -451,6 +451,8 @@ else:
     if actual_net is not None:
         disp_opts.insert(2, "Actual")
         disp_map["Actual"] = actual_net
+        disp_opts.append("Difference (Actual - LMP)")
+        disp_map["Difference (Actual - LMP)"] = actual_net - base_net
         disp_opts.append("Difference (Actual - LMP+CO2)")
         disp_map["Difference (Actual - LMP+CO2)"] = actual_net - ca_net
 
