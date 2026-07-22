@@ -19,6 +19,7 @@ from plotly.subplots import make_subplots
 from dispatch_core import (
     MASS_PER_TONNE,
     abatement_frontier,
+    evaluate_actual,
     infer_dt_hours,
     run_comparison,
     signal_alignment,
@@ -130,6 +131,15 @@ with c2:
 with c3:
     carbon_col = st.selectbox("Carbon column", cols, index=guess_col(cols, "moer", "carbon", "co2"))
 
+actual_col = st.selectbox(
+    "Actual dispatch column — net MW, + = discharge (optional)",
+    ["(none)"] + cols,
+    index=next((i + 1 for i, c in enumerate(cols)
+                if any(k in c.lower() for k in ("dispatch", "actual", "metered"))), 0),
+    help="A metered/real net-dispatch series. Adds real revenue/CO2 to the comparison "
+         "table and a real pattern to the carpet plots.",
+)
+
 # Interval length
 irregular = False
 if ts_choice != "(none / set interval manually)":
@@ -167,6 +177,15 @@ if n_bad_p or n_bad_c:
     st.caption(f"Filled {n_bad_p + n_bad_c} value(s) by linear interpolation.")
 else:
     price, carbon = price_raw, carbon_raw
+
+# Optional metered dispatch series (net MW, + = discharge).
+actual_net = None
+if actual_col != "(none)":
+    actual_net = pd.to_numeric(df[actual_col], errors="coerce").to_numpy(dtype=float)
+    n_bad_a = int(np.sum(~np.isfinite(actual_net)))
+    if n_bad_a:
+        actual_net = np.nan_to_num(actual_net, nan=0.0)
+        st.caption(f"Actual dispatch: filled {n_bad_a} missing value(s) with 0 MW.")
 
 # --------------------------------------------------------------------------- #
 # Parameters (sidebar)
@@ -251,18 +270,23 @@ h3.metric("Revenue foregone (%)",
 # Comparison table
 # --------------------------------------------------------------------------- #
 bm, cm = comp.baseline_metrics, comp.carbon_aware_metrics
+
+
+def _row(m):
+    return [m.revenue, m.net_emissions_tonnes, m.equiv_cycles, m.mwh_discharged,
+            m.simultaneous_intervals]
+
+
+cols_data = {"LMP (price only)": _row(bm), "LMP+CO2": _row(cm)}
+if actual_net is not None:
+    am = evaluate_actual(actual_net, price, carbon, dt_hours, energy_mwh, carbon_units)
+    cols_data["Actual (metered)"] = _row(am)
 table = pd.DataFrame(
-    {
-        "LMP (price only)": [bm.revenue, bm.net_emissions_tonnes, bm.equiv_cycles,
-                             bm.mwh_discharged, bm.simultaneous_intervals],
-        "LMP+CO2": [cm.revenue, cm.net_emissions_tonnes, cm.equiv_cycles,
-                    cm.mwh_discharged, cm.simultaneous_intervals],
-    },
+    cols_data,
     index=["Revenue ($)", "Net emissions (tonnes CO2)", "Equivalent full cycles",
            "MWh discharged", "Simultaneous charge+discharge intervals"],
 )
-st.dataframe(table.style.format({"LMP (price only)": "{:,.2f}", "LMP+CO2": "{:,.2f}"}),
-             width="stretch")
+st.dataframe(table.style.format({c: "{:,.2f}" for c in cols_data}), width="stretch")
 
 # Data-quality tripwires
 neg = int(np.sum(price < 0))
@@ -421,13 +445,20 @@ else:
     base_net = comp.baseline.discharge_mw - comp.baseline.charge_mw
     ca_net = comp.carbon_aware.discharge_mw - comp.carbon_aware.charge_mw
 
+    disp_opts = ["LMP+CO2", "LMP", "Difference (LMP+CO2 - LMP)"]
+    disp_map = {"LMP+CO2": ca_net, "LMP": base_net,
+                "Difference (LMP+CO2 - LMP)": ca_net - base_net}
+    if actual_net is not None:
+        disp_opts.insert(2, "Actual")
+        disp_map["Actual"] = actual_net
+        disp_opts.append("Difference (Actual - LMP+CO2)")
+        disp_map["Difference (Actual - LMP+CO2)"] = actual_net - ca_net
+
     cc1, cc2 = st.columns(2)
-    disp_choice = cc1.radio("Dispatch (MW, + = discharge)",
-                            ["LMP+CO2", "LMP", "Difference (LMP+CO2 - LMP)"])
+    disp_choice = cc1.radio("Dispatch (MW, + = discharge)", disp_opts)
     sig_choice = cc2.radio("Signal", ["MOER", "LMP", "LMP+CO2 signal"])
 
-    disp_vals = {"LMP+CO2": ca_net, "LMP": base_net,
-                 "Difference (LMP+CO2 - LMP)": ca_net - base_net}[disp_choice]
+    disp_vals = disp_map[disp_choice]
     sig_vals = {"MOER": carbon, "LMP": price,
                 "LMP+CO2 signal": comp.carbon_aware_signal}[sig_choice]
 

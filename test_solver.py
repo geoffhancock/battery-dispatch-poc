@@ -12,6 +12,7 @@ from dispatch_core import (
     abatement_frontier,
     default_carbon_prices,
     evaluate,
+    evaluate_actual,
     infer_dt_hours,
     run_comparison,
     signal_alignment,
@@ -134,6 +135,18 @@ def test_abatement_frontier_monotone():
         assert -1e-6 <= fr.capture_fraction <= 1 + 1e-6
     # Marginal cost is one shorter than the number of points.
     assert fr.marginal_cost.size == fr.carbon_prices.size - 1
+
+
+def test_evaluate_actual():
+    net = np.array([-5.0, 0.0, 5.0, 5.0])       # charge, idle, discharge, discharge
+    price = np.array([10.0, 20.0, 50.0, 40.0])
+    carbon = np.array([1000.0, 900.0, 1200.0, 1100.0])  # lbs/MWh
+    m = evaluate_actual(net, price, carbon, dt=1.0, energy_mwh=20.0, carbon_units="lbs/MWh")
+    assert abs(m.revenue - float(np.sum(price * net))) < 1e-9
+    exp_emis = float(np.sum((carbon / MASS_PER_TONNE["lbs/MWh"]) * (-net)))
+    assert abs(m.net_emissions_tonnes - exp_emis) < 1e-9
+    assert abs(m.mwh_discharged - 10.0) < 1e-9   # 5 + 5
+    assert m.simultaneous_intervals == 0
 
 
 def test_signal_alignment():

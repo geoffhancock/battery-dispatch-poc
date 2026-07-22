@@ -353,6 +353,28 @@ def run_comparison(
     )
 
 
+def evaluate_actual(net_mw, price, carbon, dt, energy_mwh, carbon_units="lbs/MWh"):
+    """Score a metered net-dispatch series (+ = discharge, - = charge).
+
+    Reconstructs charge/discharge from the net (assuming no simultaneous
+    charge+discharge, which real batteries don't do) and scores it with the same
+    accounting as the model, so metered revenue/CO2 are directly comparable to the
+    modeled scenarios.
+    """
+    net = np.asarray(net_mw, dtype=float)
+    if carbon_units not in MASS_PER_TONNE:
+        raise ValueError(f"carbon_units must be one of {list(MASS_PER_TONNE)}")
+    carbon_tonnes = np.asarray(carbon, dtype=float) / MASS_PER_TONNE[carbon_units]
+    disp = DispatchResult(
+        charge_mw=np.maximum(-net, 0.0),
+        discharge_mw=np.maximum(net, 0.0),
+        soc_mwh=np.full(net.size, np.nan),
+        objective=float("nan"), n_binaries=0, solve_s=0.0,
+        status="metered", success=True,
+    )
+    return evaluate(disp, price, carbon_tonnes, dt, energy_mwh)
+
+
 @dataclass
 class Frontier:
     """Marginal abatement cost curve: price-only -> carbon-max, swept over carbon price."""
