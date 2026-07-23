@@ -28,11 +28,16 @@ from dispatch_core import (
 # WattTime brand palette (see BRAND.md).
 BG = "#ffffff"               # chart bg matches the white main page (sidebar is gray)
 ZERO_COLOR = "#f6f6f6"       # diverging midpoint for dispatch carpets
-BASELINE_COLOR = "#434343"   # neutral grey for the price-only run
-CARBON_COLOR = "#83c341"     # green = clean-energy aggregate
+BASELINE_COLOR = "#434343"   # grey = Model A (price-optimized)
+CARBON_COLOR = "#83c341"     # green = Model B (price + CO2)
 MOER_COLOR = "#e08b66"       # gas orange for the MOER line (deliberate non-fuel choice)
+ACTUAL_COLOR = "#000000"     # black = Actual (metered) dispatch
 PRICE_COLOR = "#000000"
 MAX_INTERVALS = 200_000
+
+# Scenario naming (see the "Model A / Model B" key under Results).
+A_BRIEF, B_BRIEF, ACT_BRIEF = "A: Price Optimized", "B: Price+CO2", "Actual Dispatch"
+A_SIG, B_SIG = "A: LMP", "B: LMP+CO2"
 
 st.set_page_config(page_title="Battery Dispatch Solver", page_icon="🔋", layout="wide")
 
@@ -254,8 +259,13 @@ if not (comp.baseline.success and comp.carbon_aware.success):
 # Headline
 # --------------------------------------------------------------------------- #
 st.subheader("2. Result")
+st.caption(
+    "**Model A (Baseline):** revenue-optimized on the LMP signal  ·  "
+    "**Model B (Intervention):** carbon-aware, optimized on LMP + CO2  ·  "
+    "**Actual Dispatch:** metered series (if provided)"
+)
 with st.container(border=True):
-    st.markdown("**LMP+CO2 vs LMP (modeled, perfect foresight)**")
+    st.markdown("**Model B (Price+CO2) vs Model A (Price-optimized) — modeled, perfect foresight**")
     h1, h2, h3 = st.columns(3)
     ac = comp.abatement_cost_per_tonne
     h1.metric("Realized abatement cost",
@@ -263,38 +273,35 @@ with st.container(border=True):
               help="Revenue foregone divided by tonnes abated. The number that actually "
                    "informs a decision (the carbon-price input is arbitrary).")
     h2.metric("CO2 abated", f"{comp.tonnes_abated:,.1f} tonnes",
-              help="LMP net emissions minus LMP+CO2 net emissions.")
+              help="Model A net emissions minus Model B net emissions.")
     base_rev = comp.baseline_metrics.revenue
     rev_pct = (100 * comp.revenue_foregone / base_rev) if abs(base_rev) > 1e-9 else float("nan")
     h3.metric("Revenue foregone (%)",
               f"${comp.revenue_foregone:,.0f}" + ("" if np.isnan(rev_pct) else f" ({rev_pct:.1f}%)"),
-              help="LMP revenue minus LMP+CO2 revenue; percent is of the max (LMP-only) revenue.")
+              help="Model A revenue minus Model B revenue; percent is of the max (Model A) revenue.")
 
 # --------------------------------------------------------------------------- #
-# Comparison table (scenarios as rows, metrics as columns)
+# Comparison table (scenarios as columns, metrics as rows)
 # --------------------------------------------------------------------------- #
 bm, cm = comp.baseline_metrics, comp.carbon_aware_metrics
-REV_COL = "Revenue from arbitrage ($)"
-EMIS_COL = "Emissions change, negative = avoided (tonnes CO2)"
-CYC_COL = "Equivalent full cycles"
-
-
-def _row(m):
-    return {REV_COL: m.revenue, EMIS_COL: m.net_emissions_tonnes, CYC_COL: m.equiv_cycles,
-            "MWh discharged": m.mwh_discharged,
-            "Simultaneous charge+discharge intervals": m.simultaneous_intervals}
-
-
-rows = {"LMP (price only)": _row(bm), "LMP+CO2": _row(cm)}
+# (metric label, attribute, format) -- format gives 0 dp except cycles at 1 dp.
+metric_specs = [
+    ("Revenue from arbitrage ($)", "revenue", "{:,.0f}"),
+    ("Emissions change, negative = avoided (tonnes CO2)", "net_emissions_tonnes", "{:,.0f}"),
+    ("Equivalent full cycles", "equiv_cycles", "{:,.1f}"),
+    ("MWh discharged", "mwh_discharged", "{:,.0f}"),
+    ("Simultaneous charge+discharge intervals", "simultaneous_intervals", "{:,.0f}"),
+]
+scenarios = [(A_BRIEF, bm), (B_BRIEF, cm)]
 if actual_net is not None:
     am = evaluate_actual(actual_net, price, carbon, dt_hours, energy_mwh, carbon_units)
-    rows["Actual (metered)"] = _row(am)
-table = pd.DataFrame.from_dict(rows, orient="index")
-table.index.name = "Dispatch Scenario"
-
-fmt = {c: "{:,.0f}" for c in table.columns}
-fmt[CYC_COL] = "{:,.1f}"
-styler = table.style.format(fmt).set_table_styles([
+    scenarios.append((ACT_BRIEF, am))
+# Pre-format each cell to a string so per-row rounding is exact.
+data = {label: [fmt.format(getattr(m, attr)) for (_, attr, fmt) in metric_specs]
+        for (label, m) in scenarios}
+table = pd.DataFrame(data, index=[name for (name, _, _) in metric_specs])
+table.columns.name = "Dispatch Scenario"
+styler = table.style.set_table_styles([
     {"selector": "thead th", "props": [("text-align", "center"), ("padding", "6px 12px")]},
     {"selector": "tbody th", "props": [("text-align", "left"), ("padding", "6px 12px")]},
     {"selector": "td", "props": [("text-align", "center"), ("padding", "6px 12px")]},
@@ -315,39 +322,57 @@ st.caption("Data-quality: " + " · ".join(notes))
 # Charts
 # --------------------------------------------------------------------------- #
 x = ts if ts_choice != "(none / set interval manually)" else np.arange(len(df))
+
+with st.expander("Signal chart y-axis limits (optional)"):
+    st.caption("Tip: you can also drag on either y-axis in the chart to zoom, and double-click "
+               "to reset. MOER (right) and LMP (left) auto-scale independently by default.")
+    manual_y = st.checkbox("Set y-axis limits manually")
+    if manual_y:
+        yc1, yc2 = st.columns(2)
+        l_lo = yc1.number_input("$/MWh axis min", value=float(np.floor(np.nanmin(price))))
+        l_hi = yc1.number_input("$/MWh axis max", value=float(np.ceil(np.nanmax(price))))
+        r_lo = yc2.number_input("MOER axis min", value=float(np.floor(np.nanmin(carbon))))
+        r_hi = yc2.number_input("MOER axis max", value=float(np.ceil(np.nanmax(carbon))))
+
 fig = make_subplots(
     rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.07,
     specs=[[{"secondary_y": True}], [{"secondary_y": False}], [{"secondary_y": False}]],
-    subplot_titles=("Signal — LMP & LMP+CO2 ($/MWh, left) · MOER (lbs/MWh, right)",
+    subplot_titles=("Signal — A: LMP & B: LMP+CO2 ($/MWh, left) · MOER (lbs/MWh, right)",
                     "Net dispatch (MW, + = discharge)", "State of charge (%)"),
 )
-# Panel 1: LMP & LMP+CO2 effective signal ($/MWh, left); MOER (lbs/MWh, right).
-# One legend entry per scenario (legendgroup) so clicking toggles it across all panels.
-fig.add_trace(go.Scatter(x=x, y=comp.price, name="LMP", legendgroup="LMP",
-                         line=dict(color=PRICE_COLOR)), row=1, col=1)
-fig.add_trace(go.Scatter(x=x, y=comp.carbon_aware_signal, name="LMP+CO2", legendgroup="LMP+CO2",
+# Panel 1: A/B effective signal ($/MWh, left); MOER (lbs/MWh, right).
+# One legend entry per series (legendgroup) so clicking toggles it across all panels.
+fig.add_trace(go.Scatter(x=x, y=comp.price, name=A_SIG, legendgroup="A",
+                         line=dict(color=BASELINE_COLOR)), row=1, col=1)
+fig.add_trace(go.Scatter(x=x, y=comp.carbon_aware_signal, name=B_SIG, legendgroup="B",
                          line=dict(color=CARBON_COLOR)), row=1, col=1)
 fig.add_trace(go.Scatter(x=x, y=carbon, name="MOER", legendgroup="MOER",
                          line=dict(color=MOER_COLOR, dash="dot")), row=1, col=1, secondary_y=True)
-# Panel 2: net dispatch
+# Panel 2: net dispatch (A, B, and Actual if provided)
 fig.add_trace(go.Scatter(x=x, y=comp.baseline.discharge_mw - comp.baseline.charge_mw,
-                         name="LMP", legendgroup="LMP", showlegend=False,
+                         name=A_SIG, legendgroup="A", showlegend=False,
                          line=dict(color=BASELINE_COLOR)), row=2, col=1)
 fig.add_trace(go.Scatter(x=x, y=comp.carbon_aware.discharge_mw - comp.carbon_aware.charge_mw,
-                         name="LMP+CO2", legendgroup="LMP+CO2", showlegend=False,
+                         name=B_SIG, legendgroup="B", showlegend=False,
                          line=dict(color=CARBON_COLOR)), row=2, col=1)
+if actual_net is not None:
+    fig.add_trace(go.Scatter(x=x, y=actual_net, name=ACT_BRIEF, legendgroup="Actual",
+                             line=dict(color=ACTUAL_COLOR, dash="dash")), row=2, col=1)
 # Panel 3: SOC as percent of usable energy
 fig.add_trace(go.Scatter(x=x, y=comp.baseline.soc_mwh / energy_mwh * 100,
-                         name="LMP", legendgroup="LMP", showlegend=False,
+                         name=A_SIG, legendgroup="A", showlegend=False,
                          line=dict(color=BASELINE_COLOR)), row=3, col=1)
 fig.add_trace(go.Scatter(x=x, y=comp.carbon_aware.soc_mwh / energy_mwh * 100,
-                         name="LMP+CO2", legendgroup="LMP+CO2", showlegend=False,
+                         name=B_SIG, legendgroup="B", showlegend=False,
                          line=dict(color=CARBON_COLOR)), row=3, col=1)
 fig.update_yaxes(title_text="$/MWh", row=1, col=1, secondary_y=False)
 fig.update_yaxes(title_text="MOER (lbs/MWh)", row=1, col=1, secondary_y=True,
                  color=MOER_COLOR, showgrid=False)
 fig.update_yaxes(title_text="MW", row=2, col=1)
 fig.update_yaxes(title_text="SOC (%)", range=[0, 100], row=3, col=1)
+if manual_y:
+    fig.update_yaxes(range=[l_lo, l_hi], row=1, col=1, secondary_y=False)
+    fig.update_yaxes(range=[r_lo, r_hi], row=1, col=1, secondary_y=True)
 fig.update_layout(height=790, plot_bgcolor=BG, paper_bgcolor=BG,
                   legend=dict(orientation="h", yanchor="bottom", y=1.10,
                               xanchor="center", x=0.5),
@@ -374,9 +399,9 @@ g2.metric("Alignment in used hours", "n/a" if np.isnan(align["spearman_active"])
           else f"{align['spearman_active']:+.2f}",
           help="Spearman restricted to the intervals the battery actually charges/discharges "
                "-- the alignment it experiences. Tails matter more than the whole distribution.")
-g3.metric("% of max CO2 capture by LMP dispatch",
+g3.metric("% of max CO2 capture by Model A",
           "n/a" if np.isnan(fr.capture_fraction) else f"{fr.capture_fraction * 100:,.0f}%",
-          help="Share of the maximum avoidable CO2 that the LMP (price-only) dispatch already "
+          help="Share of the maximum avoidable CO2 that Model A (price-only) dispatch already "
                "gets for free (zero revenue cost). Low = price and carbon are weakly aligned, "
                "so most of the abatement is left on the table.")
 
@@ -387,8 +412,30 @@ has_ts = ts_choice != "(none / set interval manually)"
 # low/negative prices coincide with MOER~0.
 low_thresh = 0.1 * np.nanmax(carbon)
 low_moer = carbon <= low_thresh
-t_bar, t_dens, t_dist = st.tabs(
-    ["Curtailment by price bucket", "2D density", "MOER by price sign"])
+t_scat, t_bar, t_dens, t_dist, t_high = st.tabs(
+    ["Scatter", "Curtailment by price bucket", "2D density", "MOER by price sign",
+     "High-MOER regime"])
+
+with t_scat:
+    b0 = comp.baseline
+    is_c, is_d = b0.charge_mw > 1e-6, b0.discharge_mw > 1e-6
+    is_i = ~(is_c | is_d)
+    sc = go.Figure()
+    sc.add_trace(go.Scatter(x=price[is_i], y=carbon[is_i], mode="markers", name="Idle",
+                            marker=dict(size=4, color="#cccccc", opacity=0.25)))
+    sc.add_trace(go.Scatter(x=price[is_c], y=carbon[is_c], mode="markers",
+                            name="A charges (cheap hrs)",
+                            marker=dict(size=7, color="#aadee8", opacity=0.45)))
+    sc.add_trace(go.Scatter(x=price[is_d], y=carbon[is_d], mode="markers",
+                            name="A discharges (dear hrs)",
+                            marker=dict(size=7, color="#83c341", opacity=0.45)))
+    sc.update_layout(height=400, plot_bgcolor=BG, paper_bgcolor=BG,
+                     xaxis_title="Price ($/MWh)", yaxis_title=f"MOER ({carbon_units})",
+                     legend=dict(orientation="h", y=-0.2), margin=dict(t=30, b=40),
+                     title=f"Colored by what Model A does · Spearman {align['spearman']:+.2f}")
+    st.plotly_chart(sc, width="stretch")
+    st.caption("Each interval, colored by what Model A (price-only) does. Strong alignment puts "
+               "charge points (cheap) low on the MOER axis and discharge points (dear) high.")
 
 with t_bar:
     edges = [-np.inf, 0, 20, 40, 60, 80, 100, np.inf]
@@ -410,27 +457,53 @@ with t_bar:
                "A tall left bar means cheap/negative prices are when the grid is cleanest.")
 
 with t_dens:
+    ybin = float(np.nanmax(carbon)) / 25 if np.nanmax(carbon) > 0 else 50.0
     fd = go.Figure(go.Histogram2d(x=price, y=carbon, colorscale="Blues",
-                                  colorbar=dict(title="intervals")))
+                                  xbins=dict(start=-20, end=100, size=5),
+                                  ybins=dict(size=ybin), colorbar=dict(title="intervals")))
     fd.update_layout(height=400, plot_bgcolor=BG, paper_bgcolor=BG, margin=dict(t=30, b=40),
-                     xaxis_title=f"Price ($/MWh)", yaxis_title=f"MOER ({carbon_units})")
+                     xaxis=dict(title="Price ($/MWh)", range=[-20, 100]),
+                     yaxis_title=f"MOER ({carbon_units})")
     st.plotly_chart(fd, width="stretch")
-    st.caption("Density of intervals (darker = more). Look for a dense cell at low/negative "
-               "price + near-zero MOER — that's curtailment showing up as clean, cheap hours.")
+    st.caption("Density of intervals in the -\\$20 to \\$100 window (where most hours sit), "
+               "5 \\$/MWh bins. Look for a dense cell at low/negative price + near-zero MOER "
+               "(curtailment).")
 
 with t_dist:
     neg_mask = price < 0
+    cmax = float(np.nanmax(carbon))
+    xb = dict(start=0.0, end=(np.floor(cmax / 20) + 1) * 20, size=20)  # aligned 20-unit bins
     fh = go.Figure()
     fh.add_trace(go.Histogram(x=carbon[neg_mask], histnorm="probability", name="price < 0",
-                              marker_color=CARBON_COLOR, opacity=0.6))
+                              marker_color=CARBON_COLOR, opacity=0.6, xbins=xb))
     fh.add_trace(go.Histogram(x=carbon[~neg_mask], histnorm="probability", name="price >= 0",
-                              marker_color=BASELINE_COLOR, opacity=0.6))
+                              marker_color=BASELINE_COLOR, opacity=0.6, xbins=xb))
     fh.update_layout(height=400, plot_bgcolor=BG, paper_bgcolor=BG, barmode="overlay",
                      margin=dict(t=30, b=40), legend=dict(orientation="h", y=1.05),
                      xaxis_title=f"MOER ({carbon_units})", yaxis_title="probability")
     st.plotly_chart(fh, width="stretch")
-    st.caption("MOER distribution split by price sign. A tall near-zero spike for the "
-               "**price < 0** series means negative prices coincide with curtailment (MOER~0).")
+    st.caption("MOER distribution split by price sign (aligned 20-unit bins). A tall near-zero "
+               "spike for the **price < 0** series means negative prices coincide with "
+               "curtailment (MOER~0).")
+
+with t_high:
+    hi_thresh = 0.5 * np.nanmax(carbon)
+    hi = carbon >= hi_thresh
+    if int(hi.sum()) > 3:
+        a_hi = signal_alignment(price[hi], carbon[hi])
+        sh = go.Figure(go.Scatter(x=price[hi], y=carbon[hi], mode="markers",
+                                  marker=dict(size=6, color=MOER_COLOR, opacity=0.4)))
+        sh.update_layout(height=400, plot_bgcolor=BG, paper_bgcolor=BG, margin=dict(t=40, b=40),
+                         xaxis_title="Price ($/MWh)", yaxis_title=f"MOER ({carbon_units})",
+                         title=f"MOER >= {hi_thresh:,.0f} {carbon_units} only · "
+                               f"Spearman {a_hi['spearman']:+.2f}, Pearson {a_hi['pearson']:+.2f}")
+        st.plotly_chart(sh, width="stretch")
+        st.caption("Within the fossil-margin regime (high MOER) only, does price track MOER? A "
+                   "positive correlation here means that once the grid is on gas, more expensive "
+                   "hours are also dirtier — so price-following captures some carbon there too.")
+    else:
+        st.caption(f"Not enough intervals with MOER >= {hi_thresh:,.0f} {carbon_units} "
+                   "to show a correlation.")
 
 # --------------------------------------------------------------------------- #
 # Abatement cost curve
@@ -484,8 +557,8 @@ else:
                           legend=dict(orientation="h", y=-0.2), margin=dict(t=40, b=40))
     st.plotly_chart(fig_mac, width="stretch")
     st.caption(
-        "Realized abatement cost is revenue foregone / tonnes abated — the actual $/tonne "
-        "(different than the carbon-price input). Dotted lines: baseline ($0) and co-optimized "
+        "Realized abatement cost is revenue foregone / tonnes abated — the actual \\$/tonne "
+        "(different than the carbon-price input). Dotted lines: baseline (\\$0) and co-optimized "
         "operating points."
     )
 
@@ -505,24 +578,21 @@ else:
     base_net = comp.baseline.discharge_mw - comp.baseline.charge_mw
     ca_net = comp.carbon_aware.discharge_mw - comp.carbon_aware.charge_mw
 
-    disp_opts = ["LMP+CO2", "LMP", "Difference (LMP+CO2 - LMP)"]
-    disp_map = {"LMP+CO2": ca_net, "LMP": base_net,
-                "Difference (LMP+CO2 - LMP)": ca_net - base_net}
+    disp_opts = [B_BRIEF, A_BRIEF, "Difference (B - A)"]
+    disp_map = {B_BRIEF: ca_net, A_BRIEF: base_net, "Difference (B - A)": ca_net - base_net}
     if actual_net is not None:
-        disp_opts.insert(2, "Actual")
-        disp_map["Actual"] = actual_net
-        disp_opts.append("Difference (Actual - LMP)")
-        disp_map["Difference (Actual - LMP)"] = actual_net - base_net
-        disp_opts.append("Difference (Actual - LMP+CO2)")
-        disp_map["Difference (Actual - LMP+CO2)"] = actual_net - ca_net
+        disp_opts.insert(2, ACT_BRIEF)
+        disp_map[ACT_BRIEF] = actual_net
+        disp_opts += ["Difference (Actual - A)", "Difference (Actual - B)"]
+        disp_map["Difference (Actual - A)"] = actual_net - base_net
+        disp_map["Difference (Actual - B)"] = actual_net - ca_net
 
     cc1, cc2 = st.columns(2)
     disp_choice = cc1.radio("Dispatch (MW, + = discharge)", disp_opts)
-    sig_choice = cc2.radio("Signal", ["MOER", "LMP", "LMP+CO2 signal"])
+    sig_choice = cc2.radio("Signal", ["MOER", A_SIG, B_SIG])
 
     disp_vals = disp_map[disp_choice]
-    sig_vals = {"MOER": carbon, "LMP": price,
-                "LMP+CO2 signal": comp.carbon_aware_signal}[sig_choice]
+    sig_vals = {"MOER": carbon, A_SIG: price, B_SIG: comp.carbon_aware_signal}[sig_choice]
 
     # WattTime palette; MOER uses a deliberate clean->dirty green/yellow/coal ramp.
     disp_scale = [[0.0, "#aadee8"], [0.5, ZERO_COLOR], [1.0, "#83c341"]]  # charge->discharge
@@ -540,14 +610,14 @@ else:
     disp_ticktext = [f"{-neg_max:,.0f}", f"{-neg_max / 2:,.0f}", "0",
                      f"{pos_max / 2:,.0f}", f"{pos_max:,.0f}"]
 
-    # Signal: anchor money color scale so extreme prices don't drown the -$20..$100
-    # range; MOER keeps its full ramp.
+    # Signal: money color scale spans the 5th-95th percentile (same rule for both A
+    # and B) so a few extreme prices don't drown the rest; MOER keeps its full ramp.
     if sig_choice == "MOER":
         sig_scale, sig_unit, sig_zmin, sig_zmax = moer_scale, carbon_units, None, None
     else:
         sig_scale, sig_unit = money_scale, "$/MWh"
-        sig_zmin = float(np.nanmin(sig_pv.values))
-        sig_zmax = 100.0 if sig_choice == "LMP" else float(np.nanpercentile(sig_pv.values, 98))
+        sig_zmin = float(np.nanpercentile(sig_pv.values, 5))
+        sig_zmax = float(np.nanpercentile(sig_pv.values, 95))
 
     cfig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.09,
                          subplot_titles=(f"Dispatch — {disp_choice}", f"Signal — {sig_choice}"))
@@ -565,8 +635,8 @@ else:
     st.plotly_chart(cfig, width="stretch")
     st.caption("Discharge (green) vs charge (blue). The dispatch scale is normalized **per side**, "
                "so charge and discharge color intensity are not on the same MW scale — read the "
-               "colorbar/hover for magnitudes. LMP color is anchored at $100/MWh so the common "
-               "range stays visible. Sub-hourly data is averaged into hourly cells.")
+               "colorbar/hover for magnitudes. Price color spans the 5th-95th percentile so extreme "
+               "intervals don't wash out the rest. Sub-hourly data is averaged into hourly cells.")
 
 # --------------------------------------------------------------------------- #
 # Download
