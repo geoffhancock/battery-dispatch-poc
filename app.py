@@ -264,27 +264,37 @@ st.caption(
     "**Model B (Intervention):** carbon-aware, optimized on LMP + CO2  ·  "
     "**Actual Dispatch:** metered series (if provided)"
 )
-st.markdown(  # light-green wash on the headline box (brand green-secondary #d1e49f)
-    "<style>div[data-testid='stVerticalBlockBorderWrapper']:has(#headline-anchor)"
-    "{background-color:#d1e49f;}</style>",
+# Custom HTML headline box so the light-green wash renders reliably (&#36; = literal
+# "$" to avoid LaTeX; title= gives hover tooltips like st.metric's help).
+ac = comp.abatement_cost_per_tonne
+base_rev = comp.baseline_metrics.revenue
+rev_pct = (100 * comp.revenue_foregone / base_rev) if abs(base_rev) > 1e-9 else float("nan")
+ac_str = "N/A" if np.isnan(ac) else f"&#36;{ac:,.0f} / tonne"
+co2_str = f"{comp.tonnes_abated:,.1f} tonnes"
+rev_str = (f"&#36;{comp.revenue_foregone:,.0f}"
+           + ("" if np.isnan(rev_pct) else f" ({rev_pct:.1f}%)"))
+
+
+def _stat(label, value, tip):
+    return (f"<div title='{tip}' style='flex:1; min-width:150px;'>"
+            f"<div style='color:#434343; font-size:0.8rem;'>{label}</div>"
+            f"<div style='font-size:1.7rem; font-weight:600; color:#000;'>{value}</div></div>")
+
+
+st.markdown(
+    "<div style='background-color:#d1e49f; border:1px solid #83c341; border-radius:8px; "
+    "padding:14px 18px; margin-bottom:10px;'>"
+    "<div style='font-weight:700; margin-bottom:10px;'>Model B (Price+CO2) vs Model A "
+    "(Price-optimized) — modeled, perfect foresight</div>"
+    "<div style='display:flex; gap:28px; flex-wrap:wrap;'>"
+    + _stat("Realized abatement cost", ac_str,
+            "Revenue foregone divided by tonnes abated (the carbon-price input is arbitrary).")
+    + _stat("CO2 abated", co2_str, "Model A net emissions minus Model B net emissions.")
+    + _stat("Revenue foregone (%)", rev_str,
+            "Model A revenue minus Model B revenue; percent is of the max (Model A) revenue.")
+    + "</div></div>",
     unsafe_allow_html=True,
 )
-with st.container(border=True):
-    st.markdown("<span id='headline-anchor'></span>", unsafe_allow_html=True)
-    st.markdown("**Model B (Price+CO2) vs Model A (Price-optimized) — modeled, perfect foresight**")
-    h1, h2, h3 = st.columns(3)
-    ac = comp.abatement_cost_per_tonne
-    h1.metric("Realized abatement cost",
-              "N/A" if np.isnan(ac) else f"${ac:,.0f} / tonne",
-              help="Revenue foregone divided by tonnes abated. The number that actually "
-                   "informs a decision (the carbon-price input is arbitrary).")
-    h2.metric("CO2 abated", f"{comp.tonnes_abated:,.1f} tonnes",
-              help="Model A net emissions minus Model B net emissions.")
-    base_rev = comp.baseline_metrics.revenue
-    rev_pct = (100 * comp.revenue_foregone / base_rev) if abs(base_rev) > 1e-9 else float("nan")
-    h3.metric("Revenue foregone (%)",
-              f"${comp.revenue_foregone:,.0f}" + ("" if np.isnan(rev_pct) else f" ({rev_pct:.1f}%)"),
-              help="Model A revenue minus Model B revenue; percent is of the max (Model A) revenue.")
 
 # --------------------------------------------------------------------------- #
 # Comparison table (scenarios as columns, metrics as rows)
@@ -552,11 +562,11 @@ else:
                       secondary_y=True)
     # Dotted markers: A (price-optimized, $0) and B (co-optimized) operating points.
     fig_mac.add_vline(x=0, line=dict(color=BASELINE_COLOR, dash="dot"),
-                      annotation_text="A: LMP", annotation_position="top left")
+                      annotation_text="A: LMP ($0/t)", annotation_position="top left")
     cur = comp.abatement_cost_per_tonne
     if not np.isnan(cur):
         fig_mac.add_vline(x=cur, line=dict(color=PRICE_COLOR, dash="dot"),
-                          annotation_text="B: LMP+CO2", annotation_position="top")
+                          annotation_text=f"B: LMP+CO2 (${cur:,.0f}/t)", annotation_position="top")
 
     # Share one 0-100% grid across both axes so gridlines align (both are percentages).
     allv = np.concatenate([y_rev, y_co2])
