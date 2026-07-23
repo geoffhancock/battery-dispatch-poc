@@ -31,7 +31,7 @@ ZERO_COLOR = "#f6f6f6"       # diverging midpoint for dispatch carpets
 BASELINE_COLOR = "#434343"   # grey = Model A (price-optimized)
 CARBON_COLOR = "#83c341"     # green = Model B (price + CO2)
 MOER_COLOR = "#e08b66"       # gas orange for the MOER line (deliberate non-fuel choice)
-ACTUAL_COLOR = "#000000"     # black = Actual (metered) dispatch
+ACTUAL_COLOR = "#2b6cb0"     # blue = Actual (metered) dispatch (readable blue; not in brand palette)
 PRICE_COLOR = "#000000"
 MAX_INTERVALS = 200_000
 
@@ -264,7 +264,13 @@ st.caption(
     "**Model B (Intervention):** carbon-aware, optimized on LMP + CO2  ·  "
     "**Actual Dispatch:** metered series (if provided)"
 )
+st.markdown(  # light-green wash on the headline box (brand green-secondary #d1e49f)
+    "<style>div[data-testid='stVerticalBlockBorderWrapper']:has(#headline-anchor)"
+    "{background-color:#d1e49f;}</style>",
+    unsafe_allow_html=True,
+)
 with st.container(border=True):
+    st.markdown("<span id='headline-anchor'></span>", unsafe_allow_html=True)
     st.markdown("**Model B (Price+CO2) vs Model A (Price-optimized) — modeled, perfect foresight**")
     h1, h2, h3 = st.columns(3)
     ac = comp.abatement_cost_per_tonne
@@ -285,8 +291,9 @@ with st.container(border=True):
 # --------------------------------------------------------------------------- #
 bm, cm = comp.baseline_metrics, comp.carbon_aware_metrics
 # (metric label, attribute, format) -- format gives 0 dp except cycles at 1 dp.
+# &#36; = literal "$" (avoids Streamlit rendering $...$ as LaTeX inside the table HTML).
 metric_specs = [
-    ("Revenue from arbitrage ($)", "revenue", "{:,.0f}"),
+    ("Revenue from arbitrage (&#36;)", "revenue", "&#36;{:,.0f}"),
     ("Emissions change, negative = avoided (tonnes CO2)", "net_emissions_tonnes", "{:,.0f}"),
     ("Equivalent full cycles", "equiv_cycles", "{:,.1f}"),
     ("MWh discharged", "mwh_discharged", "{:,.0f}"),
@@ -301,11 +308,19 @@ data = {label: [fmt.format(getattr(m, attr)) for (_, attr, fmt) in metric_specs]
         for (label, m) in scenarios}
 table = pd.DataFrame(data, index=[name for (name, _, _) in metric_specs])
 table.columns.name = "Dispatch Scenario"
-styler = table.style.set_table_styles([
-    {"selector": "thead th", "props": [("text-align", "center"), ("padding", "6px 12px")]},
-    {"selector": "tbody th", "props": [("text-align", "left"), ("padding", "6px 12px")]},
-    {"selector": "td", "props": [("text-align", "center"), ("padding", "6px 12px")]},
-])
+green_cols = [A_BRIEF, B_BRIEF]                       # tie A & B to the green headline box
+last3 = [name for (name, _, _) in metric_specs[2:]]   # secondary metrics -> unbold labels
+styler = (
+    table.style
+    .set_properties(subset=green_cols, **{"background-color": "#d1e49f"})
+    .map_index(lambda v: "background-color: #d1e49f" if v in green_cols else "", axis="columns")
+    .map_index(lambda v: "font-weight: normal" if v in last3 else "", axis="index")
+    .set_table_styles([
+        {"selector": "thead th", "props": [("text-align", "center"), ("padding", "6px 12px")]},
+        {"selector": "tbody th", "props": [("text-align", "left"), ("padding", "6px 12px")]},
+        {"selector": "td", "props": [("text-align", "center"), ("padding", "6px 12px")]},
+    ])
+)
 st.markdown(styler.to_html(), unsafe_allow_html=True)
 
 # Data-quality tripwires
@@ -357,7 +372,7 @@ fig.add_trace(go.Scatter(x=x, y=comp.carbon_aware.discharge_mw - comp.carbon_awa
                          line=dict(color=CARBON_COLOR)), row=2, col=1)
 if actual_net is not None:
     fig.add_trace(go.Scatter(x=x, y=actual_net, name=ACT_BRIEF, legendgroup="Actual",
-                             line=dict(color=ACTUAL_COLOR, dash="dash")), row=2, col=1)
+                             line=dict(color=ACTUAL_COLOR, dash="dash", width=2)), row=2, col=1)
 # Panel 3: SOC as percent of usable energy
 fig.add_trace(go.Scatter(x=x, y=comp.baseline.soc_mwh / energy_mwh * 100,
                          name=A_SIG, legendgroup="A", showlegend=False,
@@ -412,8 +427,8 @@ has_ts = ts_choice != "(none / set interval manually)"
 # low/negative prices coincide with MOER~0.
 low_thresh = 0.1 * np.nanmax(carbon)
 low_moer = carbon <= low_thresh
-t_scat, t_bar, t_dens, t_dist, t_high = st.tabs(
-    ["Scatter", "Curtailment by price bucket", "2D density", "MOER by price sign",
+t_dens, t_bar, t_dist, t_scat, t_high = st.tabs(
+    ["2D density", "Curtailment by price bucket", "MOER by price sign", "Scatter",
      "High-MOER regime"])
 
 with t_scat:
@@ -427,7 +442,7 @@ with t_scat:
                             name="A charges (cheap hrs)",
                             marker=dict(size=7, color="#aadee8", opacity=0.45)))
     sc.add_trace(go.Scatter(x=price[is_d], y=carbon[is_d], mode="markers",
-                            name="A discharges (dear hrs)",
+                            name="A discharges (expensive hrs)",
                             marker=dict(size=7, color="#83c341", opacity=0.45)))
     sc.update_layout(height=400, plot_bgcolor=BG, paper_bgcolor=BG,
                      xaxis_title="Price ($/MWh)", yaxis_title=f"MOER ({carbon_units})",
@@ -435,7 +450,7 @@ with t_scat:
                      title=f"Colored by what Model A does · Spearman {align['spearman']:+.2f}")
     st.plotly_chart(sc, width="stretch")
     st.caption("Each interval, colored by what Model A (price-only) does. Strong alignment puts "
-               "charge points (cheap) low on the MOER axis and discharge points (dear) high.")
+               "charge points (cheap) low on the MOER axis and discharge points (expensive) high.")
 
 with t_bar:
     edges = [-np.inf, 0, 20, 40, 60, 80, 100, np.inf]
@@ -499,8 +514,9 @@ with t_high:
                                f"Spearman {a_hi['spearman']:+.2f}, Pearson {a_hi['pearson']:+.2f}")
         st.plotly_chart(sh, width="stretch")
         st.caption("Within the fossil-margin regime (high MOER) only, does price track MOER? A "
-                   "positive correlation here means that once the grid is on gas, more expensive "
-                   "hours are also dirtier — so price-following captures some carbon there too.")
+                   "positive correlation here means that when the grid has fossil on the margin, "
+                   "more expensive hours are also dirtier, in that case price-following would "
+                   "avoid carbon.")
     else:
         st.caption(f"Not enough intervals with MOER >= {hi_thresh:,.0f} {carbon_units} "
                    "to show a correlation.")
@@ -534,13 +550,13 @@ else:
                                  mode="lines+markers", line=dict(color=CARBON_COLOR),
                                  hovertemplate="CO2 %{y:.1f}%<br>$%{x:.1f}/t<extra></extra>"),
                       secondary_y=True)
-    # Dotted markers: baseline (LMP-only, $0) and the co-optimized operating point.
+    # Dotted markers: A (price-optimized, $0) and B (co-optimized) operating points.
     fig_mac.add_vline(x=0, line=dict(color=BASELINE_COLOR, dash="dot"),
-                      annotation_text="baseline: $0/t", annotation_position="top left")
+                      annotation_text="A: LMP", annotation_position="top left")
     cur = comp.abatement_cost_per_tonne
     if not np.isnan(cur):
         fig_mac.add_vline(x=cur, line=dict(color=PRICE_COLOR, dash="dot"),
-                          annotation_text=f"co-optimized: ${cur:,.0f}/t", annotation_position="top")
+                          annotation_text="B: LMP+CO2", annotation_position="top")
 
     # Share one 0-100% grid across both axes so gridlines align (both are percentages).
     allv = np.concatenate([y_rev, y_co2])
@@ -558,8 +574,8 @@ else:
     st.plotly_chart(fig_mac, width="stretch")
     st.caption(
         "Realized abatement cost is revenue foregone / tonnes abated — the actual \\$/tonne "
-        "(different than the carbon-price input). Dotted lines: baseline (\\$0) and co-optimized "
-        "operating points."
+        "(different than the carbon-price input). Dotted lines: A: price optimized (\\$0/t) and "
+        "price+CO2 co-optimized operating points."
     )
 
 # --------------------------------------------------------------------------- #
@@ -578,8 +594,8 @@ else:
     base_net = comp.baseline.discharge_mw - comp.baseline.charge_mw
     ca_net = comp.carbon_aware.discharge_mw - comp.carbon_aware.charge_mw
 
-    disp_opts = [B_BRIEF, A_BRIEF, "Difference (B - A)"]
-    disp_map = {B_BRIEF: ca_net, A_BRIEF: base_net, "Difference (B - A)": ca_net - base_net}
+    disp_opts = [A_BRIEF, B_BRIEF, "Difference (B - A)"]
+    disp_map = {A_BRIEF: base_net, B_BRIEF: ca_net, "Difference (B - A)": ca_net - base_net}
     if actual_net is not None:
         disp_opts.insert(2, ACT_BRIEF)
         disp_map[ACT_BRIEF] = actual_net
