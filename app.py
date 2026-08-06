@@ -228,6 +228,10 @@ carbon_price = st.sidebar.number_input("Carbon price ($/tonne CO2)", value=50.0,
                                             "meaningful output.")
 
 st.sidebar.header("Analysis")
+compute_curve = st.sidebar.checkbox(
+    "Compute abatement curve", value=True,
+    help="Section 4 runs extra solves (one per curve point) to trace revenue vs CO2. "
+         "Uncheck to skip it for much faster runs on large datasets.")
 n_points = st.sidebar.slider("Abatement-curve points", 4, 20, 10,
                              help="Carbon prices swept for the abatement curve. "
                                   "More points = smoother curve but more solves.")
@@ -413,15 +417,10 @@ st.plotly_chart(fig, width="stretch")
 # --------------------------------------------------------------------------- #
 # Signal alignment
 # --------------------------------------------------------------------------- #
-with st.spinner("Computing abatement curve..."):
-    fr = cached_frontier(price, carbon, dt_hours, power_mw, power_discharge_mw,
-                         energy_mwh, rte_pct / 100.0, carbon_units, n_points,
-                         soc_init, soc_min, cycle_cost, terminal_soc)
-
 align = signal_alignment(comp.price, comp.carbon_tonnes_per_mwh, dispatch=comp.baseline)
 
 st.subheader("3. Signal alignment")
-g1, g2, g3 = st.columns(3)
+g1, g2 = st.columns(2)
 g1.metric("LMP vs MOER alignment (Spearman)", f"{align['spearman']:+.2f}",
           help="Rank correlation of price vs carbon. Positive = cheap hours are also "
                "clean hours, so price-only dispatch incidentally abates carbon. Rank "
@@ -430,11 +429,6 @@ g2.metric("Alignment in used hours", "n/a" if np.isnan(align["spearman_active"])
           else f"{align['spearman_active']:+.2f}",
           help="Spearman restricted to the intervals the battery actually charges/discharges "
                "-- the alignment it experiences. Tails matter more than the whole distribution.")
-g3.metric("% of max CO2 capture by Model A",
-          "n/a" if np.isnan(fr.capture_fraction) else f"{fr.capture_fraction * 100:,.0f}%",
-          help="Share of the maximum avoidable CO2 that Model A (price-only) dispatch already "
-               "gets for free (zero revenue cost). Low = price and carbon are weakly aligned, "
-               "so most of the abatement is left on the table.")
 
 has_ts = ts_choice != "(none / set interval manually)"
 
@@ -538,61 +532,15 @@ with t_high:
                    "to show a correlation.")
 
 # --------------------------------------------------------------------------- #
-# Abatement cost curve
+# Abatement cost curve — placeholder here; filled at the END of the script so the
+# rest of the page paints first (the curve runs one extra solve per point).
 # --------------------------------------------------------------------------- #
 st.subheader("4. Revenue vs CO2 tradeoff")
-if not (abs(fr.baseline_revenue) > 1e-9 and abs(fr.max_avoided_tonnes) > 1e-9):
-    st.caption("Tradeoff curve unavailable: this scenario has ~zero max revenue or ~zero "
-               "avoidable CO2, so the percentages are undefined.")
+curve_slot = st.empty()
+if compute_curve:
+    curve_slot.caption("Computing the abatement curve — the rest of the page loads first…")
 else:
-    # x = REALIZED abatement cost = revenue foregone / tonnes abated (same definition
-    # as the headline metric). The carbon-price input only scales the signal and is
-    # NOT a cost, so we never put it on an axis. The x=0 point is the LMP-only
-    # dispatch (free) and equals metric #3.
-    with np.errstate(divide="ignore", invalid="ignore"):
-        realized_cost = np.where(fr.tonnes_abated > 1e-9,
-                                 fr.revenue_foregone / fr.tonnes_abated, 0.0)
-    y_rev = 100 * fr.revenue / fr.baseline_revenue
-    y_co2 = 100 * fr.avoided_tonnes / fr.max_avoided_tonnes
-    order = np.argsort(realized_cost)
-    xr, y_rev, y_co2 = realized_cost[order], y_rev[order], y_co2[order]
-
-    fig_mac = make_subplots(specs=[[{"secondary_y": True}]])
-    fig_mac.add_trace(go.Scatter(x=xr, y=y_rev, name="% of max revenue",
-                                 mode="lines+markers", line=dict(color=BASELINE_COLOR),
-                                 hovertemplate="revenue %{y:.1f}%<br>$%{x:.1f}/t<extra></extra>"),
-                      secondary_y=False)
-    fig_mac.add_trace(go.Scatter(x=xr, y=y_co2, name="% of optimal CO2",
-                                 mode="lines+markers", line=dict(color=CARBON_COLOR),
-                                 hovertemplate="CO2 %{y:.1f}%<br>$%{x:.1f}/t<extra></extra>"),
-                      secondary_y=True)
-    # Dotted markers: A (price-optimized, $0) and B (co-optimized) operating points.
-    fig_mac.add_vline(x=0, line=dict(color=BASELINE_COLOR, dash="dot"),
-                      annotation_text="A: LMP ($0/t)", annotation_position="top left")
-    cur = comp.abatement_cost_per_tonne
-    if not np.isnan(cur):
-        fig_mac.add_vline(x=cur, line=dict(color=PRICE_COLOR, dash="dot"),
-                          annotation_text=f"B: LMP+CO2 (${cur:,.0f}/t)", annotation_position="top")
-
-    # Share one 0-100% grid across both axes so gridlines align (both are percentages).
-    allv = np.concatenate([y_rev, y_co2])
-    lo = min(0.0, np.floor(np.nanmin(allv) / 25) * 25)
-    hi = max(100.0, np.ceil(np.nanmax(allv) / 25) * 25)
-    fig_mac.update_xaxes(title_text="Realized abatement cost ($/tonne CO2)")
-    fig_mac.update_yaxes(title_text="% of max revenue", secondary_y=False, range=[lo, hi],
-                         dtick=25, color=BASELINE_COLOR,
-                         tickfont=dict(color=BASELINE_COLOR), title_font=dict(color=BASELINE_COLOR))
-    fig_mac.update_yaxes(title_text="% of optimal CO2", secondary_y=True, range=[lo, hi],
-                         dtick=25, showgrid=False, color=CARBON_COLOR,
-                         tickfont=dict(color=CARBON_COLOR), title_font=dict(color=CARBON_COLOR))
-    fig_mac.update_layout(height=420, plot_bgcolor=BG, paper_bgcolor=BG,
-                          legend=dict(orientation="h", y=-0.2), margin=dict(t=40, b=40))
-    st.plotly_chart(fig_mac, width="stretch")
-    st.caption(
-        "Realized abatement cost is revenue foregone / tonnes abated — the actual \\$/tonne "
-        "(different than the carbon-price input). Dotted lines: A: price optimized (\\$0/t) and "
-        "price+CO2 co-optimized operating points."
-    )
+    curve_slot.info("Abatement curve disabled — enable **Compute abatement curve** in the sidebar.")
 
 # --------------------------------------------------------------------------- #
 # Carpet plots (day x hour-of-day)
@@ -688,3 +636,68 @@ buf = io.StringIO()
 out.to_csv(buf, index=False)
 st.download_button("Download dispatch CSV", buf.getvalue(), file_name="dispatch_results.csv",
                    mime="text/csv")
+
+# --------------------------------------------------------------------------- #
+# Deferred: compute the abatement curve LAST and fill the section-4 placeholder,
+# so everything above renders first. Skipped entirely if the checkbox is off.
+# --------------------------------------------------------------------------- #
+if compute_curve:
+    with curve_slot.container():
+        with st.spinner("Computing abatement curve (one solve per point)..."):
+            fr = cached_frontier(price, carbon, dt_hours, power_mw, power_discharge_mw,
+                                 energy_mwh, rte_pct / 100.0, carbon_units, n_points,
+                                 soc_init, soc_min, cycle_cost, terminal_soc)
+        cap = fr.capture_fraction
+        st.metric("% of max CO2 capture by Model A",
+                  "n/a" if np.isnan(cap) else f"{cap * 100:,.0f}%",
+                  help="Share of the maximum avoidable CO2 that Model A (price-only) dispatch "
+                       "already gets for free (zero revenue cost). Low = price and carbon are "
+                       "weakly aligned, so most of the abatement is left on the table.")
+        if not (abs(fr.baseline_revenue) > 1e-9 and abs(fr.max_avoided_tonnes) > 1e-9):
+            st.caption("Tradeoff curve unavailable: this scenario has ~zero max revenue or ~zero "
+                       "avoidable CO2, so the percentages are undefined.")
+        else:
+            # x = REALIZED abatement cost = revenue foregone / tonnes abated (same as the
+            # headline metric). x=0 is the Model A (price-only) endpoint.
+            with np.errstate(divide="ignore", invalid="ignore"):
+                realized_cost = np.where(fr.tonnes_abated > 1e-9,
+                                         fr.revenue_foregone / fr.tonnes_abated, 0.0)
+            y_rev = 100 * fr.revenue / fr.baseline_revenue
+            y_co2 = 100 * fr.avoided_tonnes / fr.max_avoided_tonnes
+            order = np.argsort(realized_cost)
+            xr, y_rev, y_co2 = realized_cost[order], y_rev[order], y_co2[order]
+
+            fig_mac = make_subplots(specs=[[{"secondary_y": True}]])
+            fig_mac.add_trace(go.Scatter(x=xr, y=y_rev, name="% of max revenue",
+                                         mode="lines+markers", line=dict(color=BASELINE_COLOR),
+                                         hovertemplate="revenue %{y:.1f}%<br>$%{x:.1f}/t<extra></extra>"),
+                              secondary_y=False)
+            fig_mac.add_trace(go.Scatter(x=xr, y=y_co2, name="% of optimal CO2",
+                                         mode="lines+markers", line=dict(color=CARBON_COLOR),
+                                         hovertemplate="CO2 %{y:.1f}%<br>$%{x:.1f}/t<extra></extra>"),
+                              secondary_y=True)
+            fig_mac.add_vline(x=0, line=dict(color=BASELINE_COLOR, dash="dot"),
+                              annotation_text="A: LMP ($0/t)", annotation_position="top left")
+            cur = comp.abatement_cost_per_tonne
+            if not np.isnan(cur):
+                fig_mac.add_vline(x=cur, line=dict(color=PRICE_COLOR, dash="dot"),
+                                  annotation_text=f"B: LMP+CO2 (${cur:,.0f}/t)", annotation_position="top")
+
+            allv = np.concatenate([y_rev, y_co2])
+            lo = min(0.0, np.floor(np.nanmin(allv) / 25) * 25)
+            hi = max(100.0, np.ceil(np.nanmax(allv) / 25) * 25)
+            fig_mac.update_xaxes(title_text="Realized abatement cost ($/tonne CO2)")
+            fig_mac.update_yaxes(title_text="% of max revenue", secondary_y=False, range=[lo, hi],
+                                 dtick=25, color=BASELINE_COLOR,
+                                 tickfont=dict(color=BASELINE_COLOR), title_font=dict(color=BASELINE_COLOR))
+            fig_mac.update_yaxes(title_text="% of optimal CO2", secondary_y=True, range=[lo, hi],
+                                 dtick=25, showgrid=False, color=CARBON_COLOR,
+                                 tickfont=dict(color=CARBON_COLOR), title_font=dict(color=CARBON_COLOR))
+            fig_mac.update_layout(height=420, plot_bgcolor=BG, paper_bgcolor=BG,
+                                  legend=dict(orientation="h", y=-0.2), margin=dict(t=40, b=40))
+            st.plotly_chart(fig_mac, width="stretch")
+            st.caption(
+                "Realized abatement cost is revenue foregone / tonnes abated — the actual \\$/tonne "
+                "(different than the carbon-price input). Dotted lines: A: price optimized (\\$0/t) "
+                "and price+CO2 co-optimized operating points."
+            )
