@@ -106,6 +106,8 @@ def solve_dispatch(
     terminal_soc=True,
     guard_simultaneous=True,
     power_discharge_mw=None,
+    mip_gap=None,
+    time_limit=None,
 ):
     """Optimize battery dispatch against ``signal`` ($/MWh) under perfect foresight.
 
@@ -222,11 +224,20 @@ def solve_dispatch(
     if k:
         integrality[zi] = 1
 
+    options = {}
+    if mip_gap is not None:
+        options["mip_rel_gap"] = mip_gap
+    if time_limit is not None:
+        options["time_limit"] = time_limit
+
     t0 = time.perf_counter()
-    res = milp(c=c_obj, constraints=constraints, bounds=bounds, integrality=integrality)
+    res = milp(c=c_obj, constraints=constraints, bounds=bounds, integrality=integrality,
+               options=options)
     solve_s = time.perf_counter() - t0
 
-    if not res.success or res.x is None:
+    # res.x may hold a feasible (near-optimal) incumbent even when a gap/time limit
+    # stopped the solve before proving optimality; accept it if present.
+    if res.x is None:
         return DispatchResult(
             charge_mw=np.zeros(n), discharge_mw=np.zeros(n), soc_mwh=np.full(n, np.nan),
             objective=float("nan"), n_binaries=k, solve_s=solve_s,
@@ -298,6 +309,8 @@ def run_comparison(
     cycle_cost=0.0,
     terminal_soc=True,
     guard_simultaneous=True,
+    mip_gap=None,
+    time_limit=None,
 ):
     """Run baseline (price-only) and carbon-aware dispatch, return the comparison.
 
@@ -305,6 +318,9 @@ def run_comparison(
     run trades dollars for emissions. The headline output is the *realized*
     abatement cost = revenue foregone / tonnes abated -- the number that actually
     informs a decision, since the input carbon price is somewhat arbitrary.
+
+    ``mip_gap`` / ``time_limit`` bound the solver (see solve_dispatch) -- important
+    at large scale, where the negative-price guard adds many binaries.
     """
     price = np.asarray(price, dtype=float)
     carbon = np.asarray(carbon, dtype=float)
@@ -320,6 +336,7 @@ def run_comparison(
         energy_mwh=energy_mwh, rte=rte,
         soc_init=soc_init, soc_min=soc_min, cycle_cost=cycle_cost,
         terminal_soc=terminal_soc, guard_simultaneous=guard_simultaneous,
+        mip_gap=mip_gap, time_limit=time_limit,
     )
 
     baseline_signal = price
@@ -427,6 +444,8 @@ def abatement_frontier(
     cycle_cost=0.0,
     terminal_soc=True,
     guard_simultaneous=True,
+    mip_gap=None,
+    time_limit=None,
 ):
     """Sweep the carbon price and trace the marginal abatement cost curve.
 
@@ -447,7 +466,7 @@ def abatement_frontier(
         dt=dt, power_mw=power_mw, power_discharge_mw=power_discharge_mw,
         energy_mwh=energy_mwh, rte=rte, soc_init=soc_init, soc_min=soc_min,
         cycle_cost=cycle_cost, terminal_soc=terminal_soc,
-        guard_simultaneous=guard_simultaneous,
+        guard_simultaneous=guard_simultaneous, mip_gap=mip_gap, time_limit=time_limit,
     )
 
     base = solve_dispatch(price, **common)

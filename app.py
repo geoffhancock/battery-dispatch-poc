@@ -34,6 +34,11 @@ MOER_COLOR = "#e08b66"       # gas orange for the MOER line (deliberate non-fuel
 ACTUAL_COLOR = "#2b6cb0"     # blue = Actual (metered) dispatch (readable blue; not in brand palette)
 PRICE_COLOR = "#000000"
 MAX_INTERVALS = 200_000
+# Solver bounds: the negative-price guard adds one binary per negative interval, so a
+# full year of 5-min data can blow up to a hang. A 1% gap + time limit returns a
+# near-optimal dispatch fast (proving exact optimality is what explodes).
+MIP_GAP = 0.01
+SOLVE_TIME_LIMIT = 120  # seconds per solve
 
 # Scenario naming (see the "Model A / Model B" key under Results).
 A_BRIEF, B_BRIEF, ACT_BRIEF = "A: Price Optimized", "B: Price+CO2", "Actual Dispatch"
@@ -57,7 +62,7 @@ def cached_run(price, carbon, dt, power_mw, power_discharge_mw, energy_mwh, rte,
         energy_mwh=energy_mwh, rte=rte,
         carbon_price_per_tonne=carbon_price, carbon_units=carbon_units,
         soc_init=soc_init, soc_min=soc_min, cycle_cost=cycle_cost,
-        terminal_soc=terminal_soc,
+        terminal_soc=terminal_soc, mip_gap=MIP_GAP, time_limit=SOLVE_TIME_LIMIT,
     )
 
 
@@ -70,6 +75,7 @@ def cached_frontier(price, carbon, dt, power_mw, power_discharge_mw, energy_mwh,
         power_mw=power_mw, power_discharge_mw=power_discharge_mw,
         energy_mwh=energy_mwh, rte=rte, carbon_units=carbon_units, n_points=n_points,
         soc_init=soc_init, soc_min=soc_min, cycle_cost=cycle_cost, terminal_soc=terminal_soc,
+        mip_gap=MIP_GAP, time_limit=SOLVE_TIME_LIMIT,
     )
 
 
