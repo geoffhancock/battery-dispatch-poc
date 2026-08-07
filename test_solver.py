@@ -14,10 +14,12 @@ from dispatch_core import (
     evaluate,
     evaluate_actual,
     infer_dt_hours,
+    parse_timestamps,
     run_comparison,
     signal_alignment,
     solve_dispatch,
 )
+import pandas as pd
 
 # A synthetic day with a clear price shape: cheap at night, expensive in evening.
 HOURS = 24
@@ -161,6 +163,26 @@ def test_signal_alignment():
 def test_default_carbon_prices():
     cps = default_carbon_prices(PRICE, CARBON / MASS_PER_TONNE["lbs/MWh"], n=6)
     assert cps.size == 6 and cps[0] == 0.0 and cps[-1] > 0
+
+
+def test_parse_timestamps():
+    # naive local -> unchanged, not UTC
+    ts, u = parse_timestamps(pd.Series(["2025-01-01 00:00", "2025-01-01 00:05"]))
+    assert ts.dt.tz is None and u is False and ts.dt.hour.tolist() == [0, 0]
+
+    # fixed offset -06:00 -> local wall clock kept, not UTC
+    ts, u = parse_timestamps(pd.Series(["2025-01-01 00:00:00-06:00",
+                                         "2025-07-01 12:00:00-06:00"]))
+    assert ts.dt.tz is None and u is False and ts.dt.hour.tolist() == [0, 12]
+
+    # mixed offsets (civil time across DST) -> local wall clock as written, not UTC
+    ts, u = parse_timestamps(pd.Series(["2025-01-01 00:00:00-06:00",
+                                         "2025-07-01 00:00:00-05:00"]))
+    assert ts.dt.tz is None and u is False and ts.dt.hour.tolist() == [0, 0]
+
+    # genuine UTC column -> flagged, wall clock is UTC
+    ts, u = parse_timestamps(pd.Series(["2025-01-01 06:00:00+00:00", "2025-07-01 05:00:00Z"]))
+    assert ts.dt.tz is None and u is True and ts.dt.hour.tolist() == [6, 5]
 
 
 def test_infer_dt():

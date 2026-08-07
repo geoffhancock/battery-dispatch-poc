@@ -21,6 +21,7 @@ from dispatch_core import (
     abatement_frontier,
     evaluate_actual,
     infer_dt_hours,
+    parse_timestamps,
     run_comparison,
     signal_alignment,
 )
@@ -89,19 +90,6 @@ def guess_col(cols, *keywords):
     return 0
 
 
-def parse_timestamps(series):
-    """Parse a timestamp column without crashing on mixed UTC offsets.
-
-    Naive local stays naive (local wall clock -> local-time plots). A single fixed
-    offset stays in that offset. Mixed offsets (true civil local time across a DST
-    change) can't map to one zone, so we fall back to UTC and flag it (plots then
-    read in UTC). Returns (parsed_series, tz_note) where tz_note is 'utc' if we had
-    to normalize mixed offsets, else None.
-    """
-    try:
-        return pd.to_datetime(series), None
-    except ValueError:
-        return pd.to_datetime(series, utc=True), "utc"
 
 
 st.title("🔋 Battery Dispatch Solver")
@@ -171,15 +159,14 @@ actual_col = st.selectbox(
 # Interval length
 irregular_concern = False  # only the "likely missing data" case feeds the data-quality note
 if ts_choice != "(none / set interval manually)":
-    ts, tz_note = parse_timestamps(df[ts_choice])
+    ts, is_utc = parse_timestamps(df[ts_choice])
     dt_hours, n_irr, max_gap_h = infer_dt_hours(ts.values)
     st.caption(f"Inferred interval: **{dt_hours * 60:.1f} min** ({dt_hours:.4f} h) "
                f"from the median timestamp gap.")
-    if tz_note == "utc":
-        st.warning("This column mixes UTC offsets (civil local time across a DST change), so it "
-                   "was normalized to **UTC** — carpets and the x-axis will be in UTC hours. For "
-                   "local-time plots, use a timezone-naive local column, or a fixed-offset "
-                   "(standard-time) column.")
+    if is_utc:
+        st.warning("This column is in **UTC**, so carpets and the x-axis will be in UTC hours — "
+                   "rarely what you want for hour-of-day patterns. Upload local (or offset) "
+                   "timestamps to get local-time plots.")
     if n_irr:
         # DST transitions in naive local time produce ~1-2 ~1-hour gaps/year -- benign.
         if n_irr <= 4 and max_gap_h <= 3.0:

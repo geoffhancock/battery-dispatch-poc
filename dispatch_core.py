@@ -42,6 +42,7 @@ import time
 from dataclasses import dataclass, field
 
 import numpy as np
+import pandas as pd
 from scipy.optimize import Bounds, LinearConstraint, milp
 from scipy.sparse import coo_matrix
 from scipy.stats import spearmanr
@@ -529,6 +530,32 @@ def signal_alignment(price, carbon, dispatch=None):
         if int(active.sum()) > 2:
             out["spearman_active"] = float(spearmanr(price[active], carbon[active]).statistic)
     return out
+
+
+def parse_timestamps(series):
+    """Parse a timestamp column to a timezone-NAIVE local-wall-clock series.
+
+    Any timezone offset is dropped so plots use the wall clock as written:
+      - naive input stays as-is (local),
+      - a fixed offset (e.g. -06:00) is stripped to that offset's wall clock (local),
+      - mixed offsets (civil local time across a DST change) are stripped per row,
+      - a UTC column (zero offset / 'Z') yields the UTC wall clock -> is_utc=True.
+
+    Returns ``(naive_series, is_utc)``. ``is_utc`` flags a genuinely-UTC column,
+    whose "wall clock" is UTC time and therefore NOT local for hour-of-day plots.
+    Needs no IANA zone / tzdata -- it only strips offsets, never converts zones.
+    """
+    try:
+        ts = pd.to_datetime(series)
+    except ValueError:
+        # Mixed offsets: pandas won't hold them in one column. Strip the offset text
+        # and read the local wall clock as written.
+        stripped = series.astype(str).str.replace(r"(Z|[+-]\d{2}:?\d{2})\s*$", "", regex=True)
+        return pd.to_datetime(stripped), False
+    if ts.dt.tz is None:
+        return ts, False
+    is_utc = ts.iloc[0].utcoffset() == pd.Timedelta(0)
+    return ts.dt.tz_localize(None), bool(is_utc)
 
 
 def infer_dt_hours(timestamps):
