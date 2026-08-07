@@ -45,7 +45,7 @@ SOLVE_TIME_LIMIT = 120  # seconds per solve
 # Scenario naming (see the "Model A / Model B" key under Results).
 A_BRIEF, B_BRIEF, CMAX_BRIEF, ACT_BRIEF = (
     "A: Price Optimized", "B: Price+CO2", "C: CO2 only", "Actual Dispatch")
-A_SIG, B_SIG = "A: LMP", "B: LMP+CO2"
+A_SIG, B_SIG, C_SIG = "A: LMP", "B: LMP+CO2", "C: CO2 MOER"
 
 st.set_page_config(page_title="Battery Dispatch Solver", page_icon="🔋", layout="wide")
 
@@ -593,11 +593,13 @@ else:
 
     base_net = comp.baseline.discharge_mw - comp.baseline.charge_mw
     ca_net = comp.carbon_aware.discharge_mw - comp.carbon_aware.charge_mw
+    cmax_net = comp.carbon_max.discharge_mw - comp.carbon_max.charge_mw
 
-    disp_opts = [A_BRIEF, B_BRIEF, "Difference (B - A)"]
-    disp_map = {A_BRIEF: base_net, B_BRIEF: ca_net, "Difference (B - A)": ca_net - base_net}
+    disp_opts = [A_BRIEF, B_BRIEF, CMAX_BRIEF, "Difference (B - A)"]
+    disp_map = {A_BRIEF: base_net, B_BRIEF: ca_net, CMAX_BRIEF: cmax_net,
+                "Difference (B - A)": ca_net - base_net}
     if actual_net is not None:
-        disp_opts.insert(2, ACT_BRIEF)
+        disp_opts.insert(3, ACT_BRIEF)
         disp_map[ACT_BRIEF] = actual_net
         disp_opts += ["Difference (Actual - A)", "Difference (Actual - B)"]
         disp_map["Difference (Actual - A)"] = actual_net - base_net
@@ -605,10 +607,10 @@ else:
 
     cc1, cc2 = st.columns(2)
     disp_choice = cc1.radio("Dispatch (MW, + = discharge)", disp_opts)
-    sig_choice = cc2.radio("Signal", ["MOER", A_SIG, B_SIG])
+    sig_choice = cc2.radio("Signal", [A_SIG, B_SIG, C_SIG])
 
     disp_vals = disp_map[disp_choice]
-    sig_vals = {"MOER": carbon, A_SIG: price, B_SIG: comp.carbon_aware_signal}[sig_choice]
+    sig_vals = {A_SIG: price, B_SIG: comp.carbon_aware_signal, C_SIG: carbon}[sig_choice]
 
     # WattTime palette; MOER uses a deliberate clean->dirty green/yellow/coal ramp.
     disp_scale = [[0.0, "#aadee8"], [0.5, ZERO_COLOR], [1.0, "#83c341"]]  # charge->discharge
@@ -628,7 +630,7 @@ else:
 
     # Signal: money color scale spans the 5th-95th percentile (same rule for both A
     # and B) so a few extreme prices don't drown the rest; MOER keeps its full ramp.
-    if sig_choice == "MOER":
+    if sig_choice == C_SIG:
         sig_scale, sig_unit, sig_zmin, sig_zmax = moer_scale, carbon_units, None, None
     else:
         sig_scale, sig_unit = money_scale, "$/MWh"
