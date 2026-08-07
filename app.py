@@ -89,6 +89,21 @@ def guess_col(cols, *keywords):
     return 0
 
 
+def parse_timestamps(series):
+    """Parse a timestamp column without crashing on mixed UTC offsets.
+
+    Naive local stays naive (local wall clock -> local-time plots). A single fixed
+    offset stays in that offset. Mixed offsets (true civil local time across a DST
+    change) can't map to one zone, so we fall back to UTC and flag it (plots then
+    read in UTC). Returns (parsed_series, tz_note) where tz_note is 'utc' if we had
+    to normalize mixed offsets, else None.
+    """
+    try:
+        return pd.to_datetime(series), None
+    except ValueError:
+        return pd.to_datetime(series, utc=True), "utc"
+
+
 st.title("🔋 Battery Dispatch Solver")
 st.caption(
     "Perfect-foresight, price-taking battery. Compares a price-only baseline "
@@ -154,19 +169,31 @@ actual_col = st.selectbox(
 )
 
 # Interval length
-irregular = False
+irregular_concern = False  # only the "likely missing data" case feeds the data-quality note
 if ts_choice != "(none / set interval manually)":
-    ts = pd.to_datetime(df[ts_choice])
-    dt_hours, irregular = infer_dt_hours(ts.values)
+    ts, tz_note = parse_timestamps(df[ts_choice])
+    dt_hours, n_irr, max_gap_h = infer_dt_hours(ts.values)
     st.caption(f"Inferred interval: **{dt_hours * 60:.1f} min** ({dt_hours:.4f} h) "
                f"from the median timestamp gap.")
+    if tz_note == "utc":
+        st.warning("This column mixes UTC offsets (civil local time across a DST change), so it "
+                   "was normalized to **UTC** — carpets and the x-axis will be in UTC hours. For "
+                   "local-time plots, use a timezone-naive local column, or a fixed-offset "
+                   "(standard-time) column.")
+    if n_irr:
+        # DST transitions in naive local time produce ~1-2 ~1-hour gaps/year -- benign.
+        if n_irr <= 4 and max_gap_h <= 3.0:
+            st.caption(f"{n_irr} irregular interval(s) (largest {max_gap_h * 60:.0f} min) — "
+                       "consistent with daylight-saving transitions. The solver treats rows in "
+                       "order at a uniform step, so the effect is negligible.")
+        else:
+            irregular_concern = True
+            st.warning(f"{n_irr} irregular interval(s) ({100 * n_irr / (len(ts) - 1):.1f}% of rows; "
+                       f"largest {max_gap_h * 60:.0f} min). The solver assumes a uniform step and "
+                       "treats rows in order — this many gaps may indicate missing data.")
 else:
     ts = pd.RangeIndex(len(df))
     dt_hours = st.number_input("Interval length (hours)", value=1.0, min_value=1e-3, step=0.25)
-
-if irregular:
-    st.warning("Irregular timestamp gaps detected (>1% from median). The solver assumes a "
-               "uniform interval; results may be off if gaps are real.")
 
 # Coerce to numeric (stray text -> NaN) and handle gaps: real LMP/MOER exports
 # routinely have missing intervals, and the solver needs a gap-free finite series.
@@ -349,7 +376,7 @@ sim = bm.simultaneous_intervals + cm.simultaneous_intervals
 notes = [f"{neg} negative-price interval(s) ({100 * neg / len(price):.1f}%)"]
 if sim:
     notes.append(f":red[{sim} simultaneous charge+discharge interval(s) — check the guard]")
-if irregular:
+if irregular_concern:
     notes.append(":red[irregular timestamp gaps]")
 st.caption("Data-quality: " + " · ".join(notes))
 
@@ -549,7 +576,7 @@ st.subheader("5. Dispatch & signal patterns")
 if not has_ts:
     st.caption("Upload data with a timestamp column to see day x hour-of-day carpet plots.")
 else:
-    tsi = pd.to_datetime(df[ts_choice])
+    tsi = ts  # already parsed robustly above (reuse; don't re-parse and risk a crash)
 
     def carpet(values):
         d = pd.DataFrame({"date": tsi.dt.normalize(), "hour": tsi.dt.hour, "v": values})

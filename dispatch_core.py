@@ -534,8 +534,11 @@ def signal_alignment(price, carbon, dispatch=None):
 def infer_dt_hours(timestamps):
     """Infer interval length (hours) from the median timestamp diff.
 
-    Returns ``(dt_hours, irregular)`` where ``irregular`` is True if any gap
-    deviates from the median by more than 1%.
+    Returns ``(dt_hours, n_irregular, max_gap_hours)`` where ``n_irregular`` counts
+    gaps deviating from the median by more than 1% (e.g. DST transitions in
+    naive local time produce ~2/year) and ``max_gap_hours`` is the largest gap.
+    The solver treats rows as uniform, in-order steps, so a couple of DST-sized
+    irregularities are harmless; many usually mean missing data.
     """
     ts = np.asarray(timestamps, dtype="datetime64[ns]")
     if ts.size < 2:
@@ -544,5 +547,6 @@ def infer_dt_hours(timestamps):
     median = float(np.median(diffs))
     if median <= 0:
         raise ValueError("non-increasing timestamps")
-    irregular = bool(np.any(np.abs(diffs - median) > 0.01 * median))
-    return median / 3600.0, irregular
+    n_irregular = int(np.sum(np.abs(diffs - median) > 0.01 * median))
+    max_gap_hours = float(np.max(diffs) / 3600.0)
+    return median / 3600.0, n_irregular, max_gap_hours

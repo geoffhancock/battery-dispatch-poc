@@ -166,13 +166,22 @@ def test_default_carbon_prices():
 def test_infer_dt():
     ts = np.arange("2026-01-01T00:00", "2026-01-02T00:00",
                    np.timedelta64(1, "h"), dtype="datetime64[m]")
-    dt, irregular = infer_dt_hours(ts)
-    assert abs(dt - 1.0) < 1e-9 and not irregular
+    dt, n_irr, max_gap = infer_dt_hours(ts)
+    assert abs(dt - 1.0) < 1e-9 and n_irr == 0 and abs(max_gap - 1.0) < 1e-9
 
     ts5 = np.arange("2026-01-01T00:00", "2026-01-01T02:00",
                     np.timedelta64(5, "m"), dtype="datetime64[m]")
-    dt5, irr5 = infer_dt_hours(ts5)
-    assert abs(dt5 - 5 / 60) < 1e-9 and not irr5
+    dt5, n5, _ = infer_dt_hours(ts5)
+    assert abs(dt5 - 5 / 60) < 1e-9 and n5 == 0
+
+    # A single ~1-hour gap (DST-style) in an otherwise 5-min series = one irregular.
+    before = np.arange("2026-03-09T00:00", "2026-03-09T01:00",
+                       np.timedelta64(5, "m"), dtype="datetime64[m]")   # ...00:55
+    after = np.arange("2026-03-09T02:00", "2026-03-09T03:00",
+                      np.timedelta64(5, "m"), dtype="datetime64[m]")    # 02:00 (65-min gap)
+    ts_gap = np.concatenate([before, after])
+    _, n_gap, mg = infer_dt_hours(ts_gap)
+    assert n_gap == 1 and abs(mg - 65 / 60) < 1e-6
 
 
 def test_unit_conversion():
