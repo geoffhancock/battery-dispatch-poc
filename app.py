@@ -24,6 +24,7 @@ from dispatch_core import (
     parse_timestamps,
     run_comparison,
     signal_alignment,
+    solve_dispatch,
 )
 
 # WattTime brand palette (see BRAND.md).
@@ -55,30 +56,12 @@ def load_sample():
 
 
 @st.cache_data(show_spinner=False)
-def cached_run(price, carbon, dt, power_mw, power_discharge_mw, energy_mwh, rte,
-               carbon_price, carbon_units, soc_init, soc_min, cycle_cost, terminal_soc):
-    """Cache solves keyed on the signal arrays + all parameters."""
-    return run_comparison(
-        price, carbon, dt,
-        power_mw=power_mw, power_discharge_mw=power_discharge_mw,
-        energy_mwh=energy_mwh, rte=rte,
-        carbon_price_per_tonne=carbon_price, carbon_units=carbon_units,
-        soc_init=soc_init, soc_min=soc_min, cycle_cost=cycle_cost,
-        terminal_soc=terminal_soc, mip_gap=MIP_GAP, time_limit=SOLVE_TIME_LIMIT,
-    )
-
-
-@st.cache_data(show_spinner=False)
-def cached_frontier(price, carbon, dt, power_mw, power_discharge_mw, energy_mwh, rte,
-                    carbon_units, n_points, soc_init, soc_min, cycle_cost, terminal_soc):
-    """Cache the carbon-price sweep (one baseline + n_points carbon-aware solves)."""
-    return abatement_frontier(
-        price, carbon, dt,
-        power_mw=power_mw, power_discharge_mw=power_discharge_mw,
-        energy_mwh=energy_mwh, rte=rte, carbon_units=carbon_units, n_points=n_points,
-        soc_init=soc_init, soc_min=soc_min, cycle_cost=cycle_cost, terminal_soc=terminal_soc,
-        mip_gap=MIP_GAP, time_limit=SOLVE_TIME_LIMIT,
-    )
+def cached_solve(signal, **kw):
+    """Cache one MILP solve keyed on the signal array + params. run_comparison /
+    abatement_frontier are called UNCACHED (their assembly is cheap) with this as
+    solve_fn, so the progress bar can be driven from the main thread while the
+    heavy solves stay cached across reruns."""
+    return solve_dispatch(signal, **kw)
 
 
 def guess_col(cols, *keywords):
@@ -268,12 +251,17 @@ if not st.session_state.get("has_run"):
     st.info("Set parameters in the sidebar and click **Run dispatch**.")
     st.stop()
 
-with st.spinner("Solving baseline and carbon-aware dispatch..."):
-    comp = cached_run(
-        price, carbon, dt_hours,
-        power_mw, power_discharge_mw, energy_mwh, rte_pct / 100.0,
-        carbon_price, carbon_units, soc_init, soc_min, cycle_cost, terminal_soc,
-    )
+_run_prog = st.progress(0.0, text="Solving dispatch…")
+comp = run_comparison(
+    price, carbon, dt_hours,
+    power_mw=power_mw, power_discharge_mw=power_discharge_mw,
+    energy_mwh=energy_mwh, rte=rte_pct / 100.0,
+    carbon_price_per_tonne=carbon_price, carbon_units=carbon_units,
+    soc_init=soc_init, soc_min=soc_min, cycle_cost=cycle_cost, terminal_soc=terminal_soc,
+    mip_gap=MIP_GAP, time_limit=SOLVE_TIME_LIMIT, solve_fn=cached_solve,
+    _progress=lambda f, m: _run_prog.progress(min(f, 1.0), text=m),
+)
+_run_prog.empty()
 
 if not (comp.baseline.success and comp.carbon_aware.success):
     st.error(f"Solver failed. Baseline: {comp.baseline.status}. "
@@ -289,38 +277,6 @@ st.caption(
     "**Model B (Intervention):** carbon-aware, optimized on LMP + CO2  ·  "
     "**Actual Dispatch:** metered series (if provided)"
 )
-# Custom HTML headline box so the light-green wash renders reliably (&#36; = literal
-# "$" to avoid LaTeX; title= gives hover tooltips like st.metric's help).
-ac = comp.abatement_cost_per_tonne
-base_rev = comp.baseline_metrics.revenue
-rev_pct = (100 * comp.revenue_foregone / base_rev) if abs(base_rev) > 1e-9 else float("nan")
-ac_str = "N/A" if np.isnan(ac) else f"&#36;{ac:,.0f} / tonne"
-co2_str = f"{comp.tonnes_abated:,.1f} tonnes"
-rev_str = (f"&#36;{comp.revenue_foregone:,.0f}"
-           + ("" if np.isnan(rev_pct) else f" ({rev_pct:.1f}%)"))
-
-
-def _stat(label, value, tip):
-    return (f"<div title='{tip}' style='flex:1; min-width:150px;'>"
-            f"<div style='color:#434343; font-size:0.8rem;'>{label}</div>"
-            f"<div style='font-size:1.7rem; font-weight:600; color:#000;'>{value}</div></div>")
-
-
-st.markdown(
-    "<div style='background-color:#d1e49f; border:1px solid #83c341; border-radius:8px; "
-    "padding:14px 18px; margin-bottom:10px;'>"
-    "<div style='font-weight:700; margin-bottom:10px;'>Model B (Price+CO2) vs Model A "
-    "(Price-optimized) — modeled, perfect foresight</div>"
-    "<div style='display:flex; gap:28px; flex-wrap:wrap;'>"
-    + _stat("Realized abatement cost", ac_str,
-            "Revenue foregone divided by tonnes abated (the carbon-price input is arbitrary).")
-    + _stat("CO2 abated", co2_str, "Model A net emissions minus Model B net emissions.")
-    + _stat("Revenue foregone (%)", rev_str,
-            "Model A revenue minus Model B revenue; percent is of the max (Model A) revenue.")
-    + "</div></div>",
-    unsafe_allow_html=True,
-)
-
 # --------------------------------------------------------------------------- #
 # Comparison table (scenarios as columns, metrics as rows)
 # --------------------------------------------------------------------------- #
@@ -356,7 +312,7 @@ for label, m in scenarios:
     data[label] = col
 table = pd.DataFrame(data).reindex(row_index)
 table.columns.name = "Dispatch Scenario"
-green_cols = [A_BRIEF, B_BRIEF, CMAX_BRIEF]      # modeled scenarios (Actual stays neutral)
+green_cols = [B_BRIEF]                          # highlight the intervention (Model B)
 unbold = names[2:]                              # cycles, MWh, simultaneous -> normal-weight labels
 styler = (
     table.style
@@ -370,6 +326,42 @@ styler = (
     ])
 )
 st.markdown(styler.to_html(), unsafe_allow_html=True)
+
+if abs(max_av) < 1e-9:
+    st.caption("Model C avoids ~0 CO2 (carbon price is 0, or MOER varies too little to beat "
+               "round-trip losses), so '% of max CO2 capture' is undefined.")
+
+# B-vs-A highlights box (custom HTML so the light-green wash renders reliably; &#36; = literal
+# "$" to avoid LaTeX; title= gives hover tooltips like st.metric's help).
+ac = comp.abatement_cost_per_tonne
+base_rev = comp.baseline_metrics.revenue
+rev_pct = (100 * comp.revenue_foregone / base_rev) if abs(base_rev) > 1e-9 else float("nan")
+ac_str = "N/A" if np.isnan(ac) else f"&#36;{ac:,.0f} / tonne"
+co2_str = f"{comp.tonnes_abated:,.1f} tonnes"
+rev_str = (f"&#36;{comp.revenue_foregone:,.0f}"
+           + ("" if np.isnan(rev_pct) else f" ({rev_pct:.1f}%)"))
+
+
+def _stat(label, value, tip):
+    return (f"<div title='{tip}' style='flex:1; min-width:150px;'>"
+            f"<div style='color:#434343; font-size:0.8rem;'>{label}</div>"
+            f"<div style='font-size:1.7rem; font-weight:600; color:#000;'>{value}</div></div>")
+
+
+st.markdown(
+    "<div style='background-color:#d1e49f; border:1px solid #83c341; border-radius:8px; "
+    "padding:14px 18px; margin:10px 0;'>"
+    "<div style='font-weight:700; margin-bottom:10px;'>Model B (Price+CO2) vs Model A "
+    "(Price-optimized) — modeled, perfect foresight</div>"
+    "<div style='display:flex; gap:28px; flex-wrap:wrap;'>"
+    + _stat("Realized abatement cost", ac_str,
+            "Revenue foregone divided by tonnes abated (the carbon-price input is arbitrary).")
+    + _stat("CO2 abated", co2_str, "Model A net emissions minus Model B net emissions.")
+    + _stat("Revenue foregone (%)", rev_str,
+            "Model A revenue minus Model B revenue; percent is of the max (Model A) revenue.")
+    + "</div></div>",
+    unsafe_allow_html=True,
+)
 
 # Data-quality tripwires
 neg = int(np.sum(price < 0))
@@ -677,10 +669,16 @@ st.download_button("Download dispatch CSV", buf.getvalue(), file_name="dispatch_
 # --------------------------------------------------------------------------- #
 if compute_curve:
     with curve_slot.container():
-        with st.spinner("Computing abatement curve (one solve per point)..."):
-            fr = cached_frontier(price, carbon, dt_hours, power_mw, power_discharge_mw,
-                                 energy_mwh, rte_pct / 100.0, carbon_units, n_points,
-                                 soc_init, soc_min, cycle_cost, terminal_soc)
+        _cur_prog = st.progress(0.0, text="Computing abatement curve…")
+        fr = abatement_frontier(
+            price, carbon, dt_hours,
+            power_mw=power_mw, power_discharge_mw=power_discharge_mw,
+            energy_mwh=energy_mwh, rte=rte_pct / 100.0, carbon_units=carbon_units,
+            n_points=n_points, soc_init=soc_init, soc_min=soc_min, cycle_cost=cycle_cost,
+            terminal_soc=terminal_soc, mip_gap=MIP_GAP, time_limit=SOLVE_TIME_LIMIT,
+            solve_fn=cached_solve,
+            _progress=lambda f, m: _cur_prog.progress(min(f, 1.0), text=m))
+        _cur_prog.empty()
         if not (abs(fr.baseline_revenue) > 1e-9 and abs(fr.max_avoided_tonnes) > 1e-9):
             st.caption("Tradeoff curve unavailable: this scenario has ~zero max revenue or ~zero "
                        "avoidable CO2, so the percentages are undefined.")

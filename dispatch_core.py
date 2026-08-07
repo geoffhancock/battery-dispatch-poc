@@ -315,6 +315,8 @@ def run_comparison(
     guard_simultaneous=True,
     mip_gap=None,
     time_limit=None,
+    solve_fn=None,
+    _progress=None,
 ):
     """Run baseline (price-only) and carbon-aware dispatch, return the comparison.
 
@@ -346,11 +348,23 @@ def run_comparison(
     baseline_signal = price
     carbon_aware_signal = price + carbon_price_per_tonne * carbon_tonnes
 
-    base = solve_dispatch(baseline_signal, **common)
-    ca = solve_dispatch(carbon_aware_signal, **common)
-    # Pure-CO2 (MOER-only) dispatch = the carbon-max extreme. MOER >= 0, so this has
-    # no negative-signal binaries -> a fast LP even at full-year scale.
-    cmax = solve_dispatch(carbon_tonnes, **common)
+    solve = solve_fn or solve_dispatch   # app injects a cached solver; drives progress
+
+    def _p(frac, msg):
+        if _progress is not None:
+            _progress(frac, msg)
+
+    _p(0.0, "Solving A: price-only…")
+    base = solve(baseline_signal, **common)
+    _p(1 / 3, "Solving B: price + CO2…")
+    ca = solve(carbon_aware_signal, **common)
+    # C = "Model B with LMP set to 0": optimize on the dollarized carbon value only
+    # (carbon_price * carbon_tonnes, $/MWh), so the $/MWh cycle_cost is respected and
+    # weighed against the cost of carbon exactly as in B. (A raw tonnes signal would
+    # be unit-incompatible with cycle_cost; zeroing cycle_cost would over-cycle.)
+    _p(2 / 3, "Solving C: CO2-only…")
+    cmax = solve(carbon_price_per_tonne * carbon_tonnes, **common)
+    _p(1.0, "Scoring scenarios…")
 
     base_m = evaluate(base, price, carbon_tonnes, dt, energy_mwh)
     ca_m = evaluate(ca, price, carbon_tonnes, dt, energy_mwh)
@@ -457,6 +471,8 @@ def abatement_frontier(
     guard_simultaneous=True,
     mip_gap=None,
     time_limit=None,
+    solve_fn=None,
+    _progress=None,
 ):
     """Sweep the carbon price and trace the marginal abatement cost curve.
 
@@ -480,17 +496,23 @@ def abatement_frontier(
         guard_simultaneous=guard_simultaneous, mip_gap=mip_gap, time_limit=time_limit,
     )
 
-    base = solve_dispatch(price, **common)
+    solve = solve_fn or solve_dispatch
+    base = solve(price, **common)
     base_m = evaluate(base, price, carbon_tonnes, dt, energy_mwh)
 
+    n_pts = len(carbon_prices)
+    if _progress is not None:
+        _progress(1 / (n_pts + 1), "curve: baseline solved…")
     abated, foregone, net_emissions, revenue = [], [], [], []
-    for cp in carbon_prices:
-        disp = solve_dispatch(price + cp * carbon_tonnes, **common)
+    for i, cp in enumerate(carbon_prices):
+        disp = solve(price + cp * carbon_tonnes, **common)
         m = evaluate(disp, price, carbon_tonnes, dt, energy_mwh)
         abated.append(base_m.net_emissions_tonnes - m.net_emissions_tonnes)
         foregone.append(base_m.revenue - m.revenue)
         net_emissions.append(m.net_emissions_tonnes)
         revenue.append(m.revenue)
+        if _progress is not None:
+            _progress((i + 2) / (n_pts + 1), f"curve point {i + 1}/{n_pts}…")
 
     abated = np.asarray(abated)
     foregone = np.asarray(foregone)
@@ -503,11 +525,7 @@ def abatement_frontier(
     marginal = np.where(np.abs(d_a) > _TOL, np.diff(f_s) / np.where(d_a == 0, np.nan, d_a), np.nan)
 
     baseline_avoided = -base_m.net_emissions_tonnes
-    # True max avoidable CO2 = the pure-CO2 (MOER-only) dispatch, not the largest
-    # sampled lambda (which still carries some price weight). Keeps the curve's
-    # "% of optimal CO2" consistent with the table's capture row.
-    cmax = solve_dispatch(carbon_tonnes, **common)
-    max_avoided = -evaluate(cmax, price, carbon_tonnes, dt, energy_mwh).net_emissions_tonnes
+    max_avoided = -min(net_emissions)          # most CO2 avoided over the sweep (top of curve)
     capture = baseline_avoided / max_avoided if abs(max_avoided) > _TOL else float("nan")
 
     return Frontier(
