@@ -275,13 +275,15 @@ st.subheader("2. Result")
 st.caption(
     "**Model A (Baseline):** revenue-optimized on the LMP signal  ·  "
     "**Model B (Intervention):** carbon-aware, optimized on LMP + CO2  ·  "
+    "**Model C (CO2 only):** optimal carbon outcome, for reference  ·  "
     "**Actual Dispatch:** metered series (if provided)"
 )
 # --------------------------------------------------------------------------- #
 # Comparison table (scenarios as columns, metrics as rows)
 # --------------------------------------------------------------------------- #
 bm, cm, cmx = comp.baseline_metrics, comp.carbon_aware_metrics, comp.carbon_max_metrics
-CAP_ROW = "% of max CO2 capture"
+REVCAP_ROW = "% of max revenue capture"   # denominator = Model A (revenue-optimal)
+CO2CAP_ROW = "% of max CO2 capture"       # denominator = Model C (carbon-optimal)
 # (metric label, attribute, format) -- format gives 0 dp except cycles at 1 dp.
 # &#36; = literal "$" (avoids Streamlit rendering $...$ as LaTeX inside the table HTML).
 metric_specs = [
@@ -296,19 +298,27 @@ if actual_net is not None:
     am = evaluate_actual(actual_net, price, carbon, dt_hours, energy_mwh, carbon_units)
     scenarios.append((ACT_BRIEF, am))
 
-max_av = comp.max_avoided_tonnes
+max_av = comp.max_avoided_tonnes            # Model C avoids the most CO2
+max_rev = comp.baseline_metrics.revenue     # Model A earns the most revenue
 
 
-def _capture(m):
+def _co2_cap(m):
     return "n/a" if abs(max_av) < 1e-9 else f"{100 * (-m.net_emissions_tonnes) / max_av:,.0f}%"
 
 
+def _rev_cap(m):
+    return "n/a" if abs(max_rev) < 1e-9 else f"{100 * m.revenue / max_rev:,.0f}%"
+
+
 names = [name for (name, _, _) in metric_specs]
-row_index = names[:2] + [CAP_ROW] + names[2:]   # capture row sits with the emissions row
+# Pair each headline metric with its capture %: revenue -> % of max revenue,
+# emissions -> % of max CO2.
+row_index = [names[0], REVCAP_ROW, names[1], CO2CAP_ROW] + names[2:]
 data = {}
 for label, m in scenarios:
     col = {name: fmt.format(getattr(m, attr)) for (name, attr, fmt) in metric_specs}
-    col[CAP_ROW] = _capture(m)
+    col[REVCAP_ROW] = _rev_cap(m)
+    col[CO2CAP_ROW] = _co2_cap(m)
     data[label] = col
 table = pd.DataFrame(data).reindex(row_index)
 table.columns.name = "Dispatch Scenario"
