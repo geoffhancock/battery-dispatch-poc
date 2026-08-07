@@ -42,7 +42,8 @@ MIP_GAP = 0.01
 SOLVE_TIME_LIMIT = 120  # seconds per solve
 
 # Scenario naming (see the "Model A / Model B" key under Results).
-A_BRIEF, B_BRIEF, ACT_BRIEF = "A: Price Optimized", "B: Price+CO2", "Actual Dispatch"
+A_BRIEF, B_BRIEF, CMAX_BRIEF, ACT_BRIEF = (
+    "A: Price Optimized", "B: Price+CO2", "C: CO2 only", "Actual Dispatch")
 A_SIG, B_SIG = "A: LMP", "B: LMP+CO2"
 
 st.set_page_config(page_title="Battery Dispatch Solver", page_icon="🔋", layout="wide")
@@ -323,7 +324,8 @@ st.markdown(
 # --------------------------------------------------------------------------- #
 # Comparison table (scenarios as columns, metrics as rows)
 # --------------------------------------------------------------------------- #
-bm, cm = comp.baseline_metrics, comp.carbon_aware_metrics
+bm, cm, cmx = comp.baseline_metrics, comp.carbon_aware_metrics, comp.carbon_max_metrics
+CAP_ROW = "% of max CO2 capture"
 # (metric label, attribute, format) -- format gives 0 dp except cycles at 1 dp.
 # &#36; = literal "$" (avoids Streamlit rendering $...$ as LaTeX inside the table HTML).
 metric_specs = [
@@ -333,22 +335,34 @@ metric_specs = [
     ("MWh discharged", "mwh_discharged", "{:,.0f}"),
     ("Simultaneous charge+discharge intervals", "simultaneous_intervals", "{:,.0f}"),
 ]
-scenarios = [(A_BRIEF, bm), (B_BRIEF, cm)]
+scenarios = [(A_BRIEF, bm), (B_BRIEF, cm), (CMAX_BRIEF, cmx)]
 if actual_net is not None:
     am = evaluate_actual(actual_net, price, carbon, dt_hours, energy_mwh, carbon_units)
     scenarios.append((ACT_BRIEF, am))
-# Pre-format each cell to a string so per-row rounding is exact.
-data = {label: [fmt.format(getattr(m, attr)) for (_, attr, fmt) in metric_specs]
-        for (label, m) in scenarios}
-table = pd.DataFrame(data, index=[name for (name, _, _) in metric_specs])
+
+max_av = comp.max_avoided_tonnes
+
+
+def _capture(m):
+    return "n/a" if abs(max_av) < 1e-9 else f"{100 * (-m.net_emissions_tonnes) / max_av:,.0f}%"
+
+
+names = [name for (name, _, _) in metric_specs]
+row_index = names[:2] + [CAP_ROW] + names[2:]   # capture row sits with the emissions row
+data = {}
+for label, m in scenarios:
+    col = {name: fmt.format(getattr(m, attr)) for (name, attr, fmt) in metric_specs}
+    col[CAP_ROW] = _capture(m)
+    data[label] = col
+table = pd.DataFrame(data).reindex(row_index)
 table.columns.name = "Dispatch Scenario"
-green_cols = [A_BRIEF, B_BRIEF]                       # tie A & B to the green headline box
-last3 = [name for (name, _, _) in metric_specs[2:]]   # secondary metrics -> unbold labels
+green_cols = [A_BRIEF, B_BRIEF, CMAX_BRIEF]      # modeled scenarios (Actual stays neutral)
+unbold = names[2:]                              # cycles, MWh, simultaneous -> normal-weight labels
 styler = (
     table.style
     .set_properties(subset=green_cols, **{"background-color": "#d1e49f"})
     .map_index(lambda v: "background-color: #d1e49f" if v in green_cols else "", axis="columns")
-    .map_index(lambda v: "font-weight: normal" if v in last3 else "", axis="index")
+    .map_index(lambda v: "font-weight: normal" if v in unbold else "", axis="index")
     .set_table_styles([
         {"selector": "thead th", "props": [("text-align", "center"), ("padding", "6px 12px")]},
         {"selector": "tbody th", "props": [("text-align", "left"), ("padding", "6px 12px")]},
@@ -404,6 +418,9 @@ fig.add_trace(go.Scatter(x=x, y=comp.baseline.discharge_mw - comp.baseline.charg
 fig.add_trace(go.Scatter(x=x, y=comp.carbon_aware.discharge_mw - comp.carbon_aware.charge_mw,
                          name=B_SIG, legendgroup="B", showlegend=False,
                          line=dict(color=CARBON_COLOR)), row=2, col=1)
+fig.add_trace(go.Scatter(x=x, y=comp.carbon_max.discharge_mw - comp.carbon_max.charge_mw,
+                         name=CMAX_BRIEF, legendgroup="C",
+                         line=dict(color=MOER_COLOR)), row=2, col=1)
 if actual_net is not None:
     fig.add_trace(go.Scatter(x=x, y=actual_net, name=ACT_BRIEF, legendgroup="Actual",
                              line=dict(color=ACTUAL_COLOR, dash="dash", width=2)), row=2, col=1)
@@ -414,6 +431,9 @@ fig.add_trace(go.Scatter(x=x, y=comp.baseline.soc_mwh / energy_mwh * 100,
 fig.add_trace(go.Scatter(x=x, y=comp.carbon_aware.soc_mwh / energy_mwh * 100,
                          name=B_SIG, legendgroup="B", showlegend=False,
                          line=dict(color=CARBON_COLOR)), row=3, col=1)
+fig.add_trace(go.Scatter(x=x, y=comp.carbon_max.soc_mwh / energy_mwh * 100,
+                         name=CMAX_BRIEF, legendgroup="C", showlegend=False,
+                         line=dict(color=MOER_COLOR)), row=3, col=1)
 fig.update_yaxes(title_text="$/MWh", row=1, col=1, secondary_y=False)
 fig.update_yaxes(title_text="MOER (lbs/MWh)", row=1, col=1, secondary_y=True,
                  color=MOER_COLOR, showgrid=False)
@@ -661,12 +681,6 @@ if compute_curve:
             fr = cached_frontier(price, carbon, dt_hours, power_mw, power_discharge_mw,
                                  energy_mwh, rte_pct / 100.0, carbon_units, n_points,
                                  soc_init, soc_min, cycle_cost, terminal_soc)
-        cap = fr.capture_fraction
-        st.metric("% of max CO2 capture by Model A",
-                  "n/a" if np.isnan(cap) else f"{cap * 100:,.0f}%",
-                  help="Share of the maximum avoidable CO2 that Model A (price-only) dispatch "
-                       "already gets for free (zero revenue cost). Low = price and carbon are "
-                       "weakly aligned, so most of the abatement is left on the table.")
         if not (abs(fr.baseline_revenue) > 1e-9 and abs(fr.max_avoided_tonnes) > 1e-9):
             st.caption("Tradeoff curve unavailable: this scenario has ~zero max revenue or ~zero "
                        "avoidable CO2, so the percentages are undefined.")

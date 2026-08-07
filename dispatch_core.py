@@ -83,11 +83,14 @@ class Comparison:
 
     baseline: DispatchResult
     carbon_aware: DispatchResult
+    carbon_max: DispatchResult                 # pure-CO2 (MOER-only) dispatch
     baseline_metrics: Metrics
     carbon_aware_metrics: Metrics
+    carbon_max_metrics: Metrics
     tonnes_abated: float                       # baseline_emis - carbon_aware_emis
     revenue_foregone: float                    # baseline_rev - carbon_aware_rev
     abatement_cost_per_tonne: float            # revenue_foregone / tonnes_abated
+    max_avoided_tonnes: float                  # CO2 avoided by the carbon-max dispatch
     dt: float
     price: np.ndarray = field(repr=False)
     carbon_tonnes_per_mwh: np.ndarray = field(repr=False)
@@ -345,9 +348,13 @@ def run_comparison(
 
     base = solve_dispatch(baseline_signal, **common)
     ca = solve_dispatch(carbon_aware_signal, **common)
+    # Pure-CO2 (MOER-only) dispatch = the carbon-max extreme. MOER >= 0, so this has
+    # no negative-signal binaries -> a fast LP even at full-year scale.
+    cmax = solve_dispatch(carbon_tonnes, **common)
 
     base_m = evaluate(base, price, carbon_tonnes, dt, energy_mwh)
     ca_m = evaluate(ca, price, carbon_tonnes, dt, energy_mwh)
+    cmax_m = evaluate(cmax, price, carbon_tonnes, dt, energy_mwh)
 
     tonnes_abated = base_m.net_emissions_tonnes - ca_m.net_emissions_tonnes
     revenue_foregone = base_m.revenue - ca_m.revenue
@@ -358,11 +365,14 @@ def run_comparison(
     return Comparison(
         baseline=base,
         carbon_aware=ca,
+        carbon_max=cmax,
         baseline_metrics=base_m,
         carbon_aware_metrics=ca_m,
+        carbon_max_metrics=cmax_m,
         tonnes_abated=tonnes_abated,
         revenue_foregone=revenue_foregone,
         abatement_cost_per_tonne=abatement,
+        max_avoided_tonnes=-cmax_m.net_emissions_tonnes,
         dt=dt,
         price=price,
         carbon_tonnes_per_mwh=carbon_tonnes,
@@ -493,7 +503,11 @@ def abatement_frontier(
     marginal = np.where(np.abs(d_a) > _TOL, np.diff(f_s) / np.where(d_a == 0, np.nan, d_a), np.nan)
 
     baseline_avoided = -base_m.net_emissions_tonnes
-    max_avoided = -min(net_emissions)          # most-negative net emissions = most avoided
+    # True max avoidable CO2 = the pure-CO2 (MOER-only) dispatch, not the largest
+    # sampled lambda (which still carries some price weight). Keeps the curve's
+    # "% of optimal CO2" consistent with the table's capture row.
+    cmax = solve_dispatch(carbon_tonnes, **common)
+    max_avoided = -evaluate(cmax, price, carbon_tonnes, dt, energy_mwh).net_emissions_tonnes
     capture = baseline_avoided / max_avoided if abs(max_avoided) > _TOL else float("nan")
 
     return Frontier(

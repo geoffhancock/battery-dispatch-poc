@@ -89,6 +89,17 @@ def test_carbon_aware_reduces_emissions_and_costs_money():
         assert comp.abatement_cost_per_tonne >= -1e-6
 
 
+def test_carbon_max_is_the_maximum():
+    comp = run_comparison(PRICE, CARBON, dt=1.0, carbon_price_per_tonne=100.0, **PARAMS)
+    a_av = -comp.baseline_metrics.net_emissions_tonnes
+    b_av = -comp.carbon_aware_metrics.net_emissions_tonnes
+    c_av = -comp.carbon_max_metrics.net_emissions_tonnes
+    # The pure-CO2 dispatch avoids the most; A and B can't exceed it (capture <= 100%).
+    assert c_av >= a_av - 1e-6 and c_av >= b_av - 1e-6
+    assert abs(c_av - comp.max_avoided_tonnes) < 1e-6
+    assert comp.carbon_max.success
+
+
 def test_zero_carbon_price_matches_baseline():
     comp = run_comparison(
         PRICE, CARBON, dt=1.0, carbon_price_per_tonne=0.0, **PARAMS,
