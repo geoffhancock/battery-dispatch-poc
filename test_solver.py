@@ -6,6 +6,7 @@ All console output uses ASCII only (Windows cp1252-safe).
 """
 
 import io
+import os
 import re
 from pathlib import Path
 
@@ -359,12 +360,12 @@ def test_target_value_undefined_is_nan_not_zero():
 # blocks and long zero-MOER curtailment blocks. The full-year sources live on a
 # shared drive and are exercised only when it happens to be mapped.
 # --------------------------------------------------------------------------- #
-import pathlib
-
-FIXTURES = pathlib.Path(__file__).parent / "test_data"
-SHARED = pathlib.Path(
-    r"I:\Shared drives\WattTime-Team\Partnerships\Partners"
-    r"\REDACTED\analysis\run_files")
+FIXTURES = Path(__file__).parent / "test_data"
+# Optional full-year signal files, kept outside the repo: they are far larger than
+# a fixture and, unlike the committed weeks, are not redistributable. Point
+# BDPOC_FULL_YEAR_DIR at a folder holding them to enable the full-scale test; it
+# skips cleanly when unset, so nothing here depends on one machine's drive layout.
+SHARED = Path(os.environ.get("BDPOC_FULL_YEAR_DIR", ""))
 REAL_PARAMS = dict(power_mw=10.0, energy_mwh=40.0, rte=0.85, soc_init=0.0, soc_min=0.0)
 DT_5MIN = 5.0 / 60.0
 # Match the app, so test timings reflect what a user actually waits for.
@@ -621,9 +622,11 @@ def test_full_year_shared_drive_if_available():
     coverage, and this only adds the 105k-interval scale that MAX_INTERVALS and the
     solver's time bound exist for.
     """
+    if not os.environ.get("BDPOC_FULL_YEAR_DIR"):
+        pytest.skip("set BDPOC_FULL_YEAR_DIR to a folder of full-year signal CSVs")
     src = SHARED / "NYISO_WEST_BESS_control_signal.csv"
     if not src.exists():
-        pytest.skip(f"shared drive not available: {src}")
+        pytest.skip(f"not found: {src}")
     df = pd.read_csv(src)
     price = pd.to_numeric(df["lmp_rtm"], errors="coerce").to_numpy(float)
     moer = pd.to_numeric(df["co2_moer_lb_per_mwh"], errors="coerce").to_numpy(float)

@@ -130,7 +130,7 @@ st.caption(
     "against a carbon-aware co-optimized dispatch. Open-source lightweight "
     "alternative to StorageVET for the single-service (energy-arbitrage) case."
 )
-with st.expander("About this MVP — assumptions & roadmap"):
+with st.expander("About this MVP — assumptions"):
     st.markdown(
         "- **Perfect foresight.** The optimizer sees the entire uploaded signal and "
         "dispatches optimally against it, so every result is an **upper bound** (ceiling) "
@@ -138,10 +138,7 @@ with st.expander("About this MVP — assumptions & roadmap"):
         "- **Intended inputs:** historical actuals — real-time LMP for price, historical "
         "CO2 MOER (or a pre-combined MOER+MBER) for carbon. The tool is signal-agnostic, "
         "so any $/MWh price and any mass/MWh carbon column will work.\n"
-        "- **Energy arbitrage only** — no ancillary services, no capacity.\n"
-        "- **Coming next:** a performance *floor* (day-ahead self-schedule / limited "
-        "lookahead) and a *realistic middle* (dispatch on forecast, settle on actuals) to "
-        "bracket the ceiling shown here."
+        "- **Energy arbitrage only** — no ancillary services, no capacity."
     )
 
 # --------------------------------------------------------------------------- #
