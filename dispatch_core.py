@@ -542,6 +542,236 @@ def abatement_frontier(
     )
 
 
+# How the carbon aggressiveness of a run can be specified. All three resolve to the
+# same lambda ($/tonne) that the solver actually consumes.
+#   marginal_cost        -- lambda itself. The cost of the LAST (most expensive) tonne
+#                           abated; what the optimizer is willing to pay at the margin.
+#                           Needs no inversion: lambda IS this number by construction.
+#   average_cost         -- revenue foregone / tonnes abated, over ALL abatement. Sits
+#                           BELOW marginal cost, because every inframarginal tonne cost
+#                           less than the last one. Requires inversion.
+#   pct_revenue_foregone -- revenue given up as a % of the price-only maximum. Requires
+#                           inversion. Best-behaved of the three: monotone, bounded
+#                           below by 0, and free of the 0/0 instability that average
+#                           cost has as abatement approaches zero.
+TARGET_KINDS = ("marginal_cost", "average_cost", "pct_revenue_foregone")
+
+
+@dataclass
+class TargetSolution:
+    """The carbon price that hits a requested average cost or revenue-foregone target."""
+
+    carbon_price: float        # lambda ($/tonne) to feed the solver
+    achieved: float            # the target metric actually delivered by that lambda
+    target: float              # what was asked for
+    target_kind: str
+    reached: bool              # False => target lies outside the achievable range
+    reachable_min: float       # smallest achievable value of the metric (NaN if none)
+    reachable_max: float       # largest achievable value of the metric (NaN if none)
+    n_solves: int
+    note: str                  # why the target was missed; "" when reached
+
+
+def target_value(kind, baseline_metrics, metrics):
+    """Score one carbon-aware dispatch on a target metric, against the price-only run.
+
+    Returns NaN where the metric is undefined (no abatement, or zero baseline
+    revenue) rather than a sentinel, so callers must filter explicitly.
+    """
+    abated = baseline_metrics.net_emissions_tonnes - metrics.net_emissions_tonnes
+    foregone = baseline_metrics.revenue - metrics.revenue
+    if kind == "average_cost":
+        return foregone / abated if abated > _TOL else float("nan")
+    if kind == "pct_revenue_foregone":
+        base_rev = baseline_metrics.revenue
+        return 100.0 * foregone / base_rev if abs(base_rev) > _TOL else float("nan")
+    if kind == "marginal_cost":
+        raise ValueError("marginal_cost needs no inversion -- lambda is the value")
+    raise ValueError(f"target_kind must be one of {TARGET_KINDS}, got {kind!r}")
+
+
+def solve_for_target(
+    price,
+    carbon,
+    dt,
+    *,
+    target,
+    target_kind,
+    power_mw,
+    energy_mwh,
+    rte,
+    carbon_units="lbs/MWh",
+    frontier=None,
+    n_bracket=6,
+    max_iter=8,
+    rel_tol=0.02,
+    power_discharge_mw=None,
+    soc_init=0.0,
+    soc_min=0.0,
+    cycle_cost=0.0,
+    terminal_soc=True,
+    guard_simultaneous=True,
+    mip_gap=None,
+    time_limit=None,
+    solve_fn=None,
+    _progress=None,
+):
+    """Invert a dispatch outcome back to the carbon price (lambda) that produces it.
+
+    ``target_kind`` is ``"average_cost"`` ($/tonne) or ``"pct_revenue_foregone"`` (%).
+    Both are non-decreasing in lambda, so the method is a coarse bracketing sweep
+    followed by bisection. Non-decreasing is not *strictly* increasing: MILP
+    discreteness, the terminal-SOC lock and the guard binaries all produce plateaus,
+    and a plateau spanning the target is why this bisects to a tolerance instead of
+    root-finding to machine precision.
+
+    A target outside the achievable range does NOT raise and is NOT silently clamped.
+    The returned :class:`TargetSolution` carries ``reached=False``, the nearest
+    achievable lambda, and the achievable range, so the caller can report honestly.
+
+    ``frontier`` -- pass an already-computed :class:`Frontier` to bracket the target
+    on its sweep points instead of running a private one. The two sweeps would
+    otherwise land on different lambdas (both are ``lam_max * linspace(0,1,n)**skew``,
+    which share only their endpoints for different ``n``), so nearly every solve would
+    be repeated. With a frontier supplied the cost drops to at most ``1 + max_iter``
+    solves, all of which the cache can serve; without one it is ``1 + n_bracket +
+    max_iter``.
+    """
+    if target_kind not in ("average_cost", "pct_revenue_foregone"):
+        raise ValueError(
+            f"target_kind must be 'average_cost' or 'pct_revenue_foregone', got "
+            f"{target_kind!r} (marginal_cost needs no inversion)"
+        )
+    price = np.asarray(price, dtype=float)
+    carbon = np.asarray(carbon, dtype=float)
+    if price.shape != carbon.shape:
+        raise ValueError("price and carbon must have the same length")
+    if carbon_units not in MASS_PER_TONNE:
+        raise ValueError(f"carbon_units must be one of {list(MASS_PER_TONNE)}")
+    carbon_tonnes = carbon / MASS_PER_TONNE[carbon_units]
+
+    common = dict(
+        dt=dt, power_mw=power_mw, power_discharge_mw=power_discharge_mw,
+        energy_mwh=energy_mwh, rte=rte, soc_init=soc_init, soc_min=soc_min,
+        cycle_cost=cycle_cost, terminal_soc=terminal_soc,
+        guard_simultaneous=guard_simultaneous, mip_gap=mip_gap, time_limit=time_limit,
+    )
+    solve = solve_fn or solve_dispatch
+    total = 1 + (0 if frontier is not None else n_bracket) + max_iter
+    n_done = 0
+
+    def _tick(msg):
+        if _progress is not None:
+            _progress(min(n_done / total, 1.0), msg)
+
+    _tick("Solving the price-only baseline…")
+    base_m = evaluate(solve(price, **common), price, carbon_tonnes, dt, energy_mwh)
+    n_done += 1
+
+    def value_at(lam):
+        nonlocal n_done
+        m = evaluate(solve(price + lam * carbon_tonnes, **common),
+                     price, carbon_tonnes, dt, energy_mwh)
+        n_done += 1
+        return target_value(target_kind, base_m, m)
+
+    # ---- Bracket. Reuse an existing sweep when one was handed over; both target
+    # metrics are recoverable from the Frontier's own arrays without re-solving.
+    if frontier is not None:
+        lams = [float(l) for l in frontier.carbon_prices]
+        if target_kind == "average_cost":
+            with np.errstate(divide="ignore", invalid="ignore"):
+                vals = [float(f / a) if a > _TOL else float("nan")
+                        for f, a in zip(frontier.revenue_foregone, frontier.tonnes_abated)]
+        else:
+            br = frontier.baseline_revenue
+            vals = [float(100.0 * f / br) if abs(br) > _TOL else float("nan")
+                    for f in frontier.revenue_foregone]
+        grid = np.asarray(lams, dtype=float)
+    else:
+        # default_carbon_prices starts at 0, where abatement is zero and average cost
+        # is 0/0, so the private sweep is taken from the first nonzero point up.
+        grid = default_carbon_prices(price, carbon_tonnes, n=n_bracket + 1)[1:]
+        lams = [0.0]
+        vals = [0.0 if target_kind == "pct_revenue_foregone" else float("nan")]
+        for lam in grid:
+            _tick(f"Bracketing: ${lam:,.0f}/tonne…")
+            lams.append(float(lam))
+            vals.append(value_at(float(lam)))
+
+    finite = [(l, v) for l, v in zip(lams, vals) if np.isfinite(v)]
+    if not finite:
+        return TargetSolution(
+            carbon_price=float(grid[-1]), achieved=float("nan"), target=target,
+            target_kind=target_kind, reached=False, reachable_min=float("nan"),
+            reachable_max=float("nan"), n_solves=n_done,
+            note=("No carbon price produced any abatement, so the target metric is "
+                  "undefined everywhere. The carbon signal may be flat, or too weak "
+                  "to overcome round-trip losses."),
+        )
+
+    v_min = min(v for _, v in finite)
+    v_max = max(v for _, v in finite)
+    if target > v_max:
+        l_at_max = max((l for l, v in finite if v == v_max))
+        return TargetSolution(
+            carbon_price=l_at_max, achieved=v_max, target=target,
+            target_kind=target_kind, reached=False, reachable_min=v_min,
+            reachable_max=v_max, n_solves=n_done,
+            note=("Target is above everything this battery and signal can reach. The "
+                  "most any carbon price achieves is the maximum shown; beyond it the "
+                  "dispatch is already fully carbon-optimal."),
+        )
+    if target < v_min:
+        l_at_min = min((l for l, v in finite if v == v_min))
+        return TargetSolution(
+            carbon_price=l_at_min, achieved=v_min, target=target,
+            target_kind=target_kind, reached=False, reachable_min=v_min,
+            reachable_max=v_max, n_solves=n_done,
+            note=("Target is below the cheapest abatement available. The first tonne "
+                  "the battery gives up revenue for already costs more than this."),
+        )
+
+    # ---- Bisect the bracketing pair.
+    lo, hi = 0.0, float(grid[-1])
+    lo_v = float("-inf")
+    for (l, v) in finite:
+        if v <= target and l >= lo:
+            lo, lo_v = l, v
+    for (l, v) in sorted(finite):
+        if v >= target:
+            hi = l
+            break
+
+    best_l, best_v = (lo, lo_v) if np.isfinite(lo_v) else (hi, v_max)
+    for _ in range(max_iter):
+        if np.isfinite(best_v) and abs(best_v - target) <= rel_tol * max(abs(target), _TOL):
+            break
+        mid = 0.5 * (lo + hi)
+        _tick(f"Refining: ${mid:,.0f}/tonne…")
+        v = value_at(mid)
+        if not np.isfinite(v):
+            lo = mid                      # still in the no-abatement region
+            continue
+        if abs(v - target) < abs(best_v - target) or not np.isfinite(best_v):
+            best_l, best_v = mid, v
+        if v < target:
+            lo = mid
+        else:
+            hi = mid
+
+    if _progress is not None:
+        _progress(1.0, "Target resolved.")
+    hit = np.isfinite(best_v) and abs(best_v - target) <= rel_tol * max(abs(target), _TOL)
+    return TargetSolution(
+        carbon_price=best_l, achieved=best_v, target=target, target_kind=target_kind,
+        reached=bool(hit), reachable_min=v_min, reachable_max=v_max, n_solves=n_done,
+        note=("" if hit else
+              "The achievable values step rather than vary continuously here, so the "
+              "closest reachable operating point is shown instead of an exact match."),
+    )
+
+
 def signal_alignment(price, carbon, dispatch=None):
     """Rank/level correlation between the price and carbon signals.
 

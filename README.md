@@ -6,16 +6,26 @@ single-service arbitrage case.
 
 You give it battery parameters (MW, MWh, round-trip efficiency) and a per-MWh
 signal timeseries; it returns the optimal dispatch over that horizon. Its
-distinguishing feature is **two scenarios in one run**, so you can quantify the
+distinguishing feature is **three dispatches in one run**, so you can bracket the
 carbon-vs-cost tradeoff of a battery:
 
-1. **Baseline** — dispatch against price only (usually LMP, $/MWh).
-2. **Carbon-aware** — co-optimize price *and* carbon (usually CO2 MOER, lbs/MWh;
-   or a MOER+MBER combined signal prepared upstream).
+| | Optimized against | Answers |
+|---|---|---|
+| **A — Price Optimized** | price only (usually LMP, $/MWh) | most revenue achievable |
+| **B — Price + CO2** | price *and* carbon, co-optimized | the carbon-aware operating point |
+| **C — CO2 only** | carbon only | most CO2 avoidable, at any cost |
+
+A and C are the two endpoints; B sits between them. Every dispatch is scored
+against *both* real signals, so a carbon-aware run still reports real dollars.
 
 The headline output is the **realized marginal abatement cost** — dollars of
-arbitrage revenue foregone per tonne of CO2 abated. That number, not the carbon
-price you dial in, is what tells you whether carbon-aware operation is worth it.
+arbitrage revenue foregone per tonne of CO2 abated, B against A. That number, not
+the carbon price you dial in, is what tells you whether carbon-aware operation is
+worth it.
+
+The carbon signal is usually CO2 MOER (lbs/MWh), but the tool is signal-agnostic:
+any $/MWh price column and any mass/MWh carbon column will work, including a
+pre-combined MOER+MBER prepared upstream.
 
 ## Quick start
 
@@ -23,13 +33,20 @@ price you dial in, is what tells you whether carbon-aware operation is worth it.
 # With pixi (recommended on Windows):
 pixi install
 pixi run test        # sanity tests
-pixi run app         # launch the Streamlit UI
+pixi run streamlit run app.py --server.headless true
 
 # Or with a plain venv:
 pip install -r requirements.txt
 pytest test_solver.py
-streamlit run app.py
+streamlit run app.py --server.headless true
 ```
+
+`--server.headless true` skips Streamlit's first-run email prompt, which otherwise
+blocks startup when there is no interactive terminal attached. It also binds all
+network interfaces, so the app is reachable from other machines on the same
+network — not only `localhost`. Drop the flag if you want localhost only and have
+a terminal to answer the prompt at, or create a `~/.streamlit/credentials.toml`
+containing `[general]` and `email = ""` to silence the prompt permanently.
 
 In the app: upload a CSV (or click **Load synthetic demo**), pick the timestamp /
 price / carbon columns, set battery parameters and a carbon price in the sidebar,
@@ -48,6 +65,18 @@ timestamp,lmp,moer
 ...
 ```
 
+An optional fourth column holding a **metered net-dispatch series** (net MW,
+positive = discharge) can be selected in the UI. It is scored with the same
+accounting as the modeled scenarios, adding an "Actual Dispatch" column to the
+results table and a real-world pattern to the carpet plots.
+
+Timestamps are parsed to a local wall clock: any UTC offset is stripped rather
+than converted, so hour-of-day plots read as written. A genuinely-UTC column is
+detected and flagged, because its wall clock is not local time. Missing or
+non-numeric values are reported with a count and can be linear-interpolated.
+Irregular intervals are quantified, and a DST-sized handful is distinguished from
+the many-gaps case that usually means missing data.
+
 ## Formulation
 
 MILP solved with HiGHS via `scipy.optimize.milp`. Per interval `t` of length `dt`
@@ -55,28 +84,38 @@ hours, with `eta = sqrt(rte)`:
 
 ```
 variables : charge c_t (MW), discharge d_t (MW), soc_t (MWh)
-0 <= c_t, d_t <= power_mw
+0 <= c_t <= power_mw ; 0 <= d_t <= power_discharge_mw
 soc_t = soc_{t-1} + eta*c_t*dt - d_t*dt/eta       (soc_{-1} := soc_init)
 soc_min <= soc_t <= energy_mwh
 optional  : soc_last = soc_init                    (terminal-SOC lock)
 objective : max  sum(signal_t*(d_t - c_t)*dt)  -  cycle_cost*sum(d_t*dt)
 ```
 
-### Price + carbon co-optimization
+Charge and discharge power limits can be set independently; leave them equal for a
+symmetric battery.
 
-Co-optimization is just an **effective signal** fed to the same solver:
+### The three scenarios
+
+All three are the *same solver* fed a different **effective signal**:
 
 ```
-baseline      : signal_t = price_t
-carbon-aware  : signal_t = price_t + lambda * carbon_t
-                lambda [$/tonne] = carbon_price / mass_per_tonne
-                (2204.62 lb/tonne for lbs/MWh MOER; 1000 for kg/MWh)
+A: price only   : signal_t = price_t
+B: price+carbon : signal_t = price_t + lambda * carbon_t
+C: carbon only  : signal_t =            lambda * carbon_t
+
+lambda [$/tonne] = carbon_price / mass_per_tonne
+                   (2204.62 lb/tonne for lbs/MWh MOER; 1000 for kg/MWh)
 ```
 
 Discharging displaces grid emissions (`+carbon_t*d_t`); charging causes them
 (`-carbon_t*c_t`), so net avoided emissions `= carbon_t*(d_t - c_t)*dt`, symmetric
 with the price term. Round-trip losses are respected automatically — the optimizer
 only charges when the price/MOER differential pays for the loss.
+
+Scenario C uses the **dollarized** carbon signal (`lambda * carbon_t`, in $/MWh)
+rather than raw tonnes. This matters: a raw-tonnes signal would be
+unit-incompatible with the $/MWh `cycle_cost`, and zeroing the cycle cost to
+compensate would let C over-cycle and overstate how much CO2 is really avoidable.
 
 Because the input carbon price is somewhat arbitrary (it does not map 1:1 to
 revenue foregone), the tool reports the **realized** abatement cost from the two
@@ -87,31 +126,129 @@ abatement_cost = (baseline_revenue - carbon_aware_revenue)
                  / (baseline_emissions - carbon_aware_emissions)
 ```
 
+This is an **average** cost over all abatement achieved, so it sits below the
+`carbon_price` you dialed in — that input is a *marginal* willingness to pay, and
+every tonne cheaper than the marginal one is abated too. The two are not expected
+to match.
+
+### Abatement curve
+
+Sweeping `lambda` from 0 (scenario A) upward traces the full tradeoff between
+revenue and CO2. `abatement_frontier` runs one solve per sweep point and returns
+cumulative tonnes abated, revenue foregone, and the marginal $/tonne between
+consecutive points.
+
+Sweep points are packed toward zero, and the range is built from 5th–95th
+percentile spans of both signals so that price spikes do not stretch it. The
+chart plots **realized** abatement cost on the x-axis — the same quantity as the
+headline metric — against percent of maximum revenue and percent of optimal CO2.
+
 ### Simultaneous charge+discharge guard
 
-A pure LP will run charge and discharge together on any interval where the
-*effective* signal is negative, to burn energy through round-trip losses and get
-paid/credited for the net import. The solver adds a binary only on those intervals
-(`c_t <= P*z_t`, `d_t <= P*(1-z_t)`), keyed on the scenario's own effective signal.
-A nonzero `cycle_cost` also suppresses this independently.
+A pure LP will run charge and discharge together to burn energy through round-trip
+losses and get paid for the net import — a free dump load. Shrinking both sides
+SOC-neutrally (`c -= delta`, `d -= rte*delta`) changes the objective by
+`delta*dt*[signal_t*(1 - rte) + cycle_cost*rte]`, so simultaneous dispatch is
+strictly suboptimal only above a threshold:
+
+```
+T = -cycle_cost * rte / (1 - rte)
+```
+
+A nonzero `cycle_cost` therefore does **not** remove the problem on its own — it
+only lowers the threshold. At `rte = 0.85` and `cycle_cost = $10/MWh`, T is
+-$56.67/MWh, and real negative prices reach past that. Below T the artifact is not
+objective-neutral (the LP earns `|signal|*(1 - rte)*P*dt` where the physical
+dispatch earns nothing), so no exact LP formulation exists in general.
+
+The solver adds a binary on the affected intervals (`c_t <= P*z_t`,
+`d_t <= P*(1-z_t)`), currently keyed on `signal_t < 0`. That is exactly right when
+`cycle_cost == 0` and conservative otherwise.
+
+Because the binaries are added per affected interval, a price series with many
+negative hours is the expensive case. Scenarios B and C add a non-negative carbon
+term, so they usually carry fewer binaries than A — C is typically a pure LP.
+
+### Solver bounds
+
+Large inputs are bounded rather than solved to proven optimality: `mip_gap`
+(1% in the UI) and `time_limit` (120 s per solve). Proving optimality is what
+explodes on a year of 5-minute data; a near-optimal dispatch returns quickly. A
+feasible incumbent is accepted when a bound stops the solve early.
 
 ## Module layout
 
 | File | Purpose |
 |------|---------|
-| `dispatch_core.py` | Solver + accounting. No I/O or Streamlit — importable and testable on its own. Key functions: `solve_dispatch`, `evaluate`, `run_comparison`, `infer_dt_hours`. |
+| `dispatch_core.py` | Solver + accounting. No I/O or Streamlit — importable and testable on its own. |
 | `app.py` | Streamlit UI. |
 | `test_solver.py` | Sanity tests (`pixi run test`, or `python test_solver.py` for a standalone run + performance smoke test). |
 | `sample_signals_week.csv` | Synthetic hourly week for the demo/upload. |
+| `test_data/` | Real market weeks used by the tests (see below). |
 
-`run_comparison` is the seam for a future Pareto sweep — loop it over `lambda`.
+### Test data
+
+`test_data/` holds one week per region (2,016 five-minute intervals, ~77 KB each)
+of real RTM LMP, DAM LMP and CO2 MOER, as `timestamp,lmp_rtm,lmp_dam,moer`.
+
+**Either price column is a valid dispatch signal.** Transacting day-ahead only,
+real-time only, or a mix of both are all real ways to operate a battery, so pick
+whichever column matches the strategy being modeled. DAM clears hourly, so at
+5-minute resolution it is a step function — twelve identical intervals per hour,
+which means many tied objective coefficients and, on a negative hour, twelve
+consecutive intervals entering the guard at once.
+
+The choice is not cosmetic. Over these same weeks, day-ahead-only revenue ranges
+from 24% of real-time-only (NYISO, whose RTM week contains a $2,382 scarcity spike
+that DAM never sees) to 118% (ERCOT, where the day-ahead market is simply the
+better one for a perfect-foresight battery). CAISO's average abatement cost is
+$12.76/tonne against RTM and $3.85/tonne against DAM — a 3.3x difference in the
+headline metric from the price column alone.
+
+The weeks were picked to contain what synthetic signals do not:
+
+| Fixture | Negative RTM | Zero MOER | Longest negative run |
+|---|---|---|---|
+| `CAISO_PALMSPRINGS_week.csv` | 38.0% | 43.4% | 11.0 h |
+| `ERCOT_EASTTX_week.csv` | 17.1% | 17.3% | 21.6 h |
+| `SRP_week.csv` | 36.6% | 35.2% | 11.0 h |
+| `NYISO_WEST_week.csv` | 0% | 0% | — (RTM peaks at $2,382) |
+
+Zero MOER is renewable curtailment on the margin — charging then induces no
+emissions — and is concentrated in spring midday hours in the solar-heavy regions.
+It is signal, not missing data.
+
+These weeks are what makes the simultaneous-charge guard testable. Unguarded, the
+LP finds the dump load on all three negative-price weeks and overstates revenue by
+1.5–2.3%; NYISO has no negative intervals, so the guard adds no binaries there.
+
+Tests also run against full-year (105,120-interval) versions of the same signals
+when the source drive happens to be mapped, and skip cleanly when it is not.
+
+Key functions in `dispatch_core.py`:
+
+| Function | Returns |
+|---|---|
+| `solve_dispatch` | `DispatchResult` — one MILP solve against one effective signal |
+| `run_comparison` | `Comparison` — scenarios A, B and C plus the realized abatement cost |
+| `evaluate` | `Metrics` — scores any dispatch against the real price and carbon signals |
+| `evaluate_actual` | `Metrics` for a metered net-MW series, using identical accounting |
+| `abatement_frontier` | `Frontier` — the carbon-price sweep |
+| `default_carbon_prices` | a sweep range inferred from the signals |
+| `signal_alignment` | Spearman / Pearson price-vs-carbon correlation, overall and over active intervals only |
+| `parse_timestamps` | `(naive_series, is_utc)` — offsets stripped to local wall clock |
+| `infer_dt_hours` | `(dt_hours, n_irregular, max_gap_hours)` |
+
+`run_comparison` and `abatement_frontier` both accept a `solve_fn`, which is the
+seam the UI uses to inject a cached solver, and a `_progress` callback.
 
 ## Known simplifications (vs StorageVET)
 
 Perfect foresight; price-taker (dispatch does not move the price); single service
 (no ancillary/capacity stacking); symmetric efficiency split (`eta = sqrt(rte)` on
 both charge and discharge); throughput penalty only (no SOC-dependent degradation,
-calendar aging, or auxiliary load); no separate import/export tariffs.
+calendar aging, or auxiliary load); no separate import/export tariffs. Rows are
+treated as uniform, in-order steps, so irregular intervals are not re-timed.
 
 ### Validating against StorageVET
 
@@ -126,8 +263,10 @@ Free options: [Streamlit Community Cloud](https://share.streamlit.io) or Hugging
 Face Spaces (push the repo, point at `app.py`). Before publishing publicly:
 
 - Pin exact versions (`==`) in `requirements.txt` so rebuilds cannot break.
-- Keep the input-size cap in `app.py` (`MAX_INTERVALS`) to protect free-tier memory.
-- Add caching keyed on (params, file hash) if solves get heavy.
+- Keep the input-size cap in `app.py` (`MAX_INTERVALS`, 200,000 intervals) to
+  protect free-tier memory.
+- Bound the solve cache (`max_entries`, `ttl`), which is currently unbounded — a
+  long session over large inputs retains every solved dispatch.
 
 ## Roadmap
 
@@ -145,5 +284,6 @@ historical actuals (real-time LMP + historical MOER). Planned next:
 3. **Per-project settlement mode** — DA self-schedule / DA+RT-settled deviations /
    RT-only, selectable per project.
 
-Also deferred: Pareto λ-sweep frontier; WattTime MOER API fetch (per-user auth);
-separate MOER/MBER columns; batch/portfolio comparison across projects.
+Also deferred: targeting a realized abatement cost directly instead of a carbon
+price; WattTime MOER API fetch (per-user auth); separate MOER/MBER columns;
+batch/portfolio comparison across projects.

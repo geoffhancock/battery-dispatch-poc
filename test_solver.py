@@ -6,6 +6,7 @@ All console output uses ASCII only (Windows cp1252-safe).
 """
 
 import numpy as np
+import pytest
 
 from dispatch_core import (
     MASS_PER_TONNE,
@@ -18,6 +19,8 @@ from dispatch_core import (
     run_comparison,
     signal_alignment,
     solve_dispatch,
+    solve_for_target,
+    target_value,
 )
 import pandas as pd
 
@@ -30,6 +33,16 @@ PRICE = 30 + 40 * np.sin((_t - 8) / 24 * 2 * np.pi)          # ~ -10 to 70 $/MWh
 CARBON = 900 + 300 * np.sin((_t - 10) / 24 * 2 * np.pi)       # lbs/MWh
 
 PARAMS = dict(power_mw=10.0, energy_mwh=40.0, rte=0.85, soc_init=0.0, soc_min=0.0)
+
+# A 24-hour horizon admits only a handful of distinct dispatches, so outcome metrics
+# move in large steps (on the signal above: 0%, 1.2%, 6.1%, 9.6% revenue foregone and
+# nothing between). Targeting tests need a longer, noisier signal where the achievable
+# set is fine enough for a target to land inside it.
+_WEEK_N = 168
+_wt = np.arange(_WEEK_N)
+_wrng = np.random.default_rng(0)
+WEEK_PRICE = 30 + 40 * np.sin((_wt - 8) / 24 * 2 * np.pi) + _wrng.normal(0, 8, _WEEK_N)
+WEEK_CARBON = 900 + 300 * np.sin((_wt - 10) / 24 * 2 * np.pi) + _wrng.normal(0, 60, _WEEK_N)
 
 
 def _bounds_hold(res, dt, params, tol=1e-4):
@@ -222,6 +235,264 @@ def test_unit_conversion():
     assert MASS_PER_TONNE["kg/MWh"] == 1000.0
 
 
+def test_average_cost_is_below_marginal():
+    """The core framing claim: average abatement cost < the marginal cost that set it.
+
+    lambda is the marginal willingness to pay, so every inframarginal tonne costs
+    less and drags the average down. If this ever inverts, the two labels in the UI
+    are lying.
+    """
+    for lam in (150.0, 300.0, 1000.0):
+        comp = run_comparison(PRICE, CARBON, dt=1.0, carbon_price_per_tonne=lam, **PARAMS)
+        assert comp.tonnes_abated > 1e-6, f"no abatement at lambda={lam}"
+        assert comp.abatement_cost_per_tonne < lam, (
+            f"average {comp.abatement_cost_per_tonne:.1f} should be below marginal {lam}")
+
+
+def test_solve_for_target_hits_pct_revenue():
+    """Revenue-foregone targeting is the well-behaved case: bounded and monotone."""
+    sol = solve_for_target(WEEK_PRICE, WEEK_CARBON, dt=1.0, target=5.0,
+                           target_kind="pct_revenue_foregone", **PARAMS)
+    assert sol.reached, f"should hit 5% revenue foregone; note={sol.note}"
+    assert abs(sol.achieved - 5.0) <= 0.02 * 5.0
+    # Re-running at the resolved lambda must reproduce the achieved value.
+    comp = run_comparison(WEEK_PRICE, WEEK_CARBON, dt=1.0,
+                          carbon_price_per_tonne=sol.carbon_price, **PARAMS)
+    pct = 100 * comp.revenue_foregone / comp.baseline_metrics.revenue
+    assert abs(pct - sol.achieved) < 1e-6
+
+
+def test_solve_for_target_hits_average_cost():
+    sol = solve_for_target(WEEK_PRICE, WEEK_CARBON, dt=1.0, target=40.0,
+                           target_kind="average_cost", **PARAMS)
+    assert sol.reached, f"should hit $40/tonne average; note={sol.note}"
+    comp = run_comparison(WEEK_PRICE, WEEK_CARBON, dt=1.0,
+                          carbon_price_per_tonne=sol.carbon_price, **PARAMS)
+    assert abs(comp.abatement_cost_per_tonne - sol.achieved) < 1e-6
+    # The whole point of the two labels: what you asked for is the average, and the
+    # marginal cost the solver needed to get there is higher.
+    assert sol.carbon_price > sol.achieved
+
+
+def test_solve_for_target_unreachable_is_flagged_not_clamped():
+    """An impossible target must come back reached=False -- never silently nearest."""
+    sol = solve_for_target(WEEK_PRICE, WEEK_CARBON, dt=1.0, target=100.0,
+                           target_kind="pct_revenue_foregone", **PARAMS)
+    assert not sol.reached
+    assert sol.note
+    assert sol.achieved < 100.0
+
+
+def test_frontier_reuse_matches_private_sweep_with_fewer_solves():
+    """Handing solve_for_target an existing frontier must not change the answer.
+
+    The two sweeps land on different lambdas (lam_max*linspace(0,1,n)**skew shares
+    only its endpoints across different n), so without reuse the curve and the target
+    search repeat nearly every solve.
+    """
+    fr = abatement_frontier(WEEK_PRICE, WEEK_CARBON, dt=1.0, n_points=10, **PARAMS)
+    counter = {"n": 0}
+
+    def counting_solve(signal, **kw):
+        counter["n"] += 1
+        return solve_dispatch(signal, **kw)
+
+    reused = solve_for_target(WEEK_PRICE, WEEK_CARBON, dt=1.0, target=5.0,
+                              target_kind="pct_revenue_foregone", frontier=fr,
+                              solve_fn=counting_solve, **PARAMS)
+    n_reused = counter["n"]
+    counter["n"] = 0
+    private = solve_for_target(WEEK_PRICE, WEEK_CARBON, dt=1.0, target=5.0,
+                               target_kind="pct_revenue_foregone",
+                               solve_fn=counting_solve, **PARAMS)
+    n_private = counter["n"]
+
+    assert n_reused < n_private, (
+        f"reuse should cost fewer solves, got {n_reused} vs {n_private}")
+    assert reused.reached and private.reached
+    # Both land on the same plateau of the achievable set.
+    assert abs(reused.achieved - private.achieved) <= 0.02 * 5.0
+
+
+def test_coarse_horizon_target_is_reported_not_faked():
+    """A short horizon has few distinct dispatches, so most targets are unreachable.
+
+    On the 24-hour signal the only achievable revenue-foregone values are roughly
+    0%, 1.2%, 6.1% and 9.6%. Asking for 5% cannot succeed; the contract is that it
+    comes back reached=False with the bracketing range, never a fabricated match.
+    """
+    sol = solve_for_target(PRICE, CARBON, dt=1.0, target=5.0,
+                           target_kind="pct_revenue_foregone", **PARAMS)
+    assert not sol.reached
+    assert np.isfinite(sol.reachable_min) and np.isfinite(sol.reachable_max)
+    assert sol.reachable_min <= sol.achieved <= sol.reachable_max
+    assert sol.note
+
+
+def test_solve_for_target_rejects_marginal_kind():
+    """marginal_cost needs no inversion; asking for it is a caller error."""
+    for bad in ("marginal_cost", "nonsense"):
+        try:
+            solve_for_target(PRICE, CARBON, dt=1.0, target=10.0, target_kind=bad, **PARAMS)
+        except ValueError:
+            continue
+        raise AssertionError(f"target_kind={bad!r} should have raised")
+
+
+def test_target_value_undefined_is_nan_not_zero():
+    """No abatement => the average cost is 0/0. It must be NaN, not a fake 0."""
+    comp = run_comparison(PRICE, CARBON, dt=1.0, carbon_price_per_tonne=0.0, **PARAMS)
+    v = target_value("average_cost", comp.baseline_metrics, comp.carbon_aware_metrics)
+    assert np.isnan(v)
+
+
+# --------------------------------------------------------------------------- #
+# Real market data
+#
+# Committed fixtures are one week (2,016 five-minute intervals) per region, chosen
+# to contain the cases synthetic sine signals never produce: long negative-price
+# blocks and long zero-MOER curtailment blocks. The full-year sources live on a
+# shared drive and are exercised only when it happens to be mapped.
+# --------------------------------------------------------------------------- #
+import pathlib
+
+FIXTURES = pathlib.Path(__file__).parent / "test_data"
+SHARED = pathlib.Path(
+    r"I:\Shared drives\WattTime-Team\Partnerships\Partners"
+    r"\REDACTED\analysis\run_files")
+REAL_PARAMS = dict(power_mw=10.0, energy_mwh=40.0, rte=0.85, soc_init=0.0, soc_min=0.0)
+DT_5MIN = 5.0 / 60.0
+# Match the app, so test timings reflect what a user actually waits for.
+BOUNDS = dict(mip_gap=0.01, time_limit=120)
+
+
+WEEKS = ("CAISO_PALMSPRINGS", "ERCOT_EASTTX", "NYISO_WEST", "SRP")
+
+
+def _load_week(name, price_col="lmp_rtm"):
+    """Load a fixture week. Either price column is a valid dispatch signal: a
+    battery can transact day-ahead only, real-time only, or a mix of both."""
+    df = pd.read_csv(FIXTURES / f"{name}_week.csv")
+    return (df[price_col].to_numpy(float), df["moer"].to_numpy(float),
+            df["timestamp"])
+
+
+def test_real_weeks_solve_and_respect_physics():
+    """Every committed week must solve and obey the battery's physical limits.
+
+    Run against BOTH price columns: day-ahead-only and real-time-only are each a
+    valid way to operate a battery, so both must be first-class dispatch signals.
+    """
+    for name in WEEKS:
+        for price_col in ("lmp_rtm", "lmp_dam"):
+            price, moer, _ = _load_week(name, price_col)
+            assert len(price) == 2016, f"{name}: expected a 7-day 5-minute week"
+            comp = run_comparison(price, moer, dt=DT_5MIN, carbon_price_per_tonne=50.0,
+                                  **REAL_PARAMS, **BOUNDS)
+            tag = f"{name}/{price_col}"
+            for label, res in (("A", comp.baseline), ("B", comp.carbon_aware),
+                               ("C", comp.carbon_max)):
+                assert res.success, f"{tag} scenario {label} failed: {res.status}"
+                _bounds_hold(res, DT_5MIN, REAL_PARAMS)
+            # A is revenue-optimal and C is carbon-optimal, by construction.
+            assert comp.baseline_metrics.revenue >= comp.carbon_aware_metrics.revenue - 1e-6
+            assert (-comp.carbon_max_metrics.net_emissions_tonnes
+                    >= -comp.carbon_aware_metrics.net_emissions_tonnes - 1e-6)
+
+
+def test_day_ahead_prices_are_hourly_steps():
+    """DAM clears hourly, so at 5-minute resolution it is a step function.
+
+    Twelve identical intervals per hour means many tied objective coefficients, and
+    a negative DAM hour puts twelve consecutive intervals into the guard at once
+    rather than one. Worth pinning: a fixture regenerated from the wrong column
+    would silently lose this structure.
+    """
+    for name in WEEKS:
+        dam, _, _ = _load_week(name, "lmp_dam")
+        # A 7-day week is 168 hours; allow for consecutive hours clearing equal.
+        assert len(np.unique(dam)) <= 200, f"{name}: DAM looks sub-hourly"
+        run_lengths = [len(list(g)) for g in
+                       np.split(dam, np.flatnonzero(np.diff(dam)) + 1)]
+        assert min(run_lengths) >= 12, (
+            f"{name}: DAM changes within an hour (shortest hold "
+            f"{min(run_lengths)} intervals)")
+        assert max(run_lengths) % 12 == 0, f"{name}: DAM holds are not hour-aligned"
+
+
+def test_real_weeks_guard_actually_suppresses_the_dump_load():
+    """The guard is load-bearing on real negative prices, not a theoretical nicety.
+
+    CAISO's fixture week is 38% negative with an 11-hour longest run, well past the
+    energy/power saturation point where an unguarded LP starts running charge and
+    discharge together to burn energy for the net import. With the guard on there
+    must be none; with it off and no cycle cost there must be some.
+    """
+    price, moer, _ = _load_week("CAISO_PALMSPRINGS")
+    assert (price < 0).mean() > 0.3, "fixture should be negative-price heavy"
+
+    guarded = solve_dispatch(price, dt=DT_5MIN, cycle_cost=0.0,
+                             guard_simultaneous=True, **REAL_PARAMS, **BOUNDS)
+    m_guard = evaluate(guarded, price, moer / MASS_PER_TONNE["lbs/MWh"],
+                       DT_5MIN, REAL_PARAMS["energy_mwh"])
+    assert m_guard.simultaneous_intervals == 0
+    assert guarded.n_binaries > 0
+
+    unguarded = solve_dispatch(price, dt=DT_5MIN, cycle_cost=0.0,
+                               guard_simultaneous=False, **REAL_PARAMS, **BOUNDS)
+    m_un = evaluate(unguarded, price, moer / MASS_PER_TONNE["lbs/MWh"],
+                    DT_5MIN, REAL_PARAMS["energy_mwh"])
+    assert unguarded.n_binaries == 0
+    assert m_un.simultaneous_intervals > 0, (
+        "an unguarded LP should exploit this week; if this fails the artifact is "
+        "not reachable here and the guard's scope should be revisited")
+
+
+def test_real_week_average_below_marginal():
+    """The marginal-vs-average framing, on real LMP and MOER rather than sine waves."""
+    for name in ("CAISO_PALMSPRINGS", "NYISO_WEST"):
+        price, moer, _ = _load_week(name)
+        lam = 100.0
+        comp = run_comparison(price, moer, dt=DT_5MIN, carbon_price_per_tonne=lam,
+                              **REAL_PARAMS, **BOUNDS)
+        if comp.tonnes_abated > 1e-6:
+            assert comp.abatement_cost_per_tonne < lam, (
+                f"{name}: average {comp.abatement_cost_per_tonne:.1f} should be "
+                f"below marginal {lam}")
+
+
+def test_real_week_timestamps_parse_as_uniform_five_minute():
+    """Fixtures are local wall clock, so the interval must infer cleanly at 5 min."""
+    for name in ("CAISO_PALMSPRINGS", "ERCOT_EASTTX", "NYISO_WEST", "SRP"):
+        _, _, ts = _load_week(name)
+        parsed, is_utc = parse_timestamps(ts)
+        assert not is_utc, f"{name}: fixtures are local, not UTC"
+        dt_h, n_irr, max_gap = infer_dt_hours(parsed.values)
+        assert abs(dt_h - DT_5MIN) < 1e-9, f"{name}: inferred {dt_h * 60:.2f} min"
+        assert n_irr == 0, f"{name}: {n_irr} irregular gaps, max {max_gap:.2f} h"
+
+
+def test_full_year_shared_drive_if_available():
+    """Full-scale check against a year of 5-minute data, when the drive is mapped.
+
+    Skipped rather than failed off-network: the fixtures above are the portable
+    coverage, and this only adds the 105k-interval scale that MAX_INTERVALS and the
+    solver's time bound exist for.
+    """
+    src = SHARED / "NYISO_WEST_BESS_control_signal.csv"
+    if not src.exists():
+        pytest.skip(f"shared drive not available: {src}")
+    df = pd.read_csv(src)
+    price = pd.to_numeric(df["lmp_rtm"], errors="coerce").to_numpy(float)
+    moer = pd.to_numeric(df["co2_moer_lb_per_mwh"], errors="coerce").to_numpy(float)
+    assert len(price) == 105_120, f"expected a full 5-minute year, got {len(price):,}"
+    # NYISO is the cheap one to solve (0.2% negative intervals => few binaries).
+    res = solve_dispatch(price, dt=DT_5MIN, **REAL_PARAMS, **BOUNDS)
+    assert res.success, res.status
+    _bounds_hold(res, DT_5MIN, REAL_PARAMS)
+    assert res.solve_s < 120 * 1.5, f"solve took {res.solve_s:.1f}s past its bound"
+
+
 def _perf_smoke():
     """Not a pytest assertion -- prints solve times for large horizons."""
     rng = np.random.default_rng(0)
@@ -241,7 +512,11 @@ if __name__ == "__main__":
     # Standalone runner (no pytest needed).
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
-            fn()
+            try:
+                fn()
+            except pytest.skip.Exception as exc:
+                print(f"SKIP {name}: {exc}")
+                continue
             print(f"PASS {name}")
     print("Performance smoke test:")
     _perf_smoke()

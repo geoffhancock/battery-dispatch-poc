@@ -25,6 +25,7 @@ from dispatch_core import (
     run_comparison,
     signal_alignment,
     solve_dispatch,
+    solve_for_target,
 )
 
 # WattTime brand palette (see BRAND.md).
@@ -46,6 +47,12 @@ SOLVE_TIME_LIMIT = 120  # seconds per solve
 A_BRIEF, B_BRIEF, CMAX_BRIEF, ACT_BRIEF = (
     "A: Price Optimized", "B: Price+CO2", "C: CO2 only", "Actual Dispatch")
 A_SIG, B_SIG, C_SIG = "A: LMP", "B: LMP+CO2", "C: CO2 MOER"
+
+# Ways to specify how hard Model B leans on carbon. All resolve to the same $/tonne
+# lambda; the latter two are solved for. See dispatch_core.TARGET_KINDS.
+MODE_MARGINAL = "Marginal abatement cost ($/tonne)"
+MODE_AVERAGE = "Average abatement cost ($/tonne)"
+MODE_PCT = "Revenue foregone (%)"
 
 st.set_page_config(page_title="Battery Dispatch Solver", page_icon="🔋", layout="wide")
 
@@ -127,7 +134,11 @@ with c1:
     ts_choice = st.selectbox("Timestamp column", ["(none / set interval manually)"] + cols,
                              index=(cols.index("timestamp") + 1) if "timestamp" in cols else 0)
 with c2:
-    price_col = st.selectbox("Price column ($/MWh)", cols, index=guess_col(cols, "lmp", "price"))
+    price_col = st.selectbox(
+        "Price column ($/MWh)", cols, index=guess_col(cols, "lmp", "price"),
+        help="Day-ahead and real-time are both valid dispatch signals — pick the one "
+             "matching the strategy you're modeling. A day-ahead column clears hourly, "
+             "so at sub-hourly resolution it steps rather than varies.")
 with c3:
     carbon_col = st.selectbox("Carbon column", cols, index=guess_col(cols, "moer", "carbon", "co2"))
 
@@ -220,10 +231,31 @@ cycle_cost = st.sidebar.number_input("Cycle cost ($/MWh discharged)", value=0.0,
 
 st.sidebar.header("Carbon")
 carbon_units = st.sidebar.selectbox("Carbon signal units", list(MASS_PER_TONNE.keys()), index=0)
-carbon_price = st.sidebar.number_input("Carbon price ($/tonne CO2)", value=50.0, min_value=0.0, step=5.0,
-                                       help="How aggressively the carbon-aware run trades $ for emissions. "
-                                            "The input value is arbitrary; the realized abatement cost is the "
-                                            "meaningful output.")
+target_mode = st.sidebar.radio(
+    "Set carbon aggressiveness by",
+    [MODE_MARGINAL, MODE_AVERAGE, MODE_PCT],
+    help="Three ways to say the same thing. Marginal cost is what the optimizer pays for "
+         "the LAST tonne and is applied directly. The other two describe the outcome you "
+         "want and are solved for, which costs extra solves.",
+)
+if target_mode == MODE_MARGINAL:
+    carbon_price = st.sidebar.number_input(
+        "Marginal abatement cost ($/tonne CO2)", value=50.0, min_value=0.0, step=5.0,
+        help="What you are willing to pay for the most expensive tonne. Every tonne "
+             "cheaper than this is abated too, so the average cost comes out lower.")
+    target_value_in, target_kind = None, None
+elif target_mode == MODE_AVERAGE:
+    target_value_in = st.sidebar.number_input(
+        "Average abatement cost ($/tonne CO2)", value=25.0, min_value=0.0, step=5.0,
+        help="Total revenue foregone divided by total tonnes abated -- the headline "
+             "number. Solved for by searching over marginal cost.")
+    carbon_price, target_kind = None, "average_cost"
+else:
+    target_value_in = st.sidebar.number_input(
+        "Revenue foregone (% of max)", value=5.0, min_value=0.0, max_value=100.0, step=1.0,
+        help="How much of the price-only revenue you will give up. Bounded and monotone, "
+             "so this is the most reliable of the three targets to hit.")
+    carbon_price, target_kind = None, "pct_revenue_foregone"
 
 st.sidebar.header("Analysis")
 compute_curve = st.sidebar.checkbox(
@@ -250,6 +282,60 @@ if st.button("Run dispatch", type="primary"):
 if not st.session_state.get("has_run"):
     st.info("Set parameters in the sidebar and click **Run dispatch**.")
     st.stop()
+
+# If the user specified an outcome rather than a marginal cost, find the carbon price
+# that delivers it before running the three-scenario comparison.
+#
+# Inverting a target needs a carbon-price sweep, and the tradeoff curve IS that sweep,
+# so it is computed ONCE here and handed to both. Running them separately would repeat
+# nearly every solve: both sweeps are lam_max*linspace(0,1,n)**skew, which for
+# different n share only their endpoints, so the cache cannot bridge them.
+frontier = None
+target_sol = None
+sweep_kw = dict(
+    power_mw=power_mw, power_discharge_mw=power_discharge_mw,
+    energy_mwh=energy_mwh, rte=rte_pct / 100.0, carbon_units=carbon_units,
+    soc_init=soc_init, soc_min=soc_min, cycle_cost=cycle_cost,
+    terminal_soc=terminal_soc, mip_gap=MIP_GAP, time_limit=SOLVE_TIME_LIMIT,
+    solve_fn=cached_solve,
+)
+if target_kind is not None:
+    # With the curve switched off the sweep is still required, just coarser: it only
+    # has to bracket the target, not draw smoothly.
+    sweep_n = n_points if compute_curve else 6
+    _f_prog = st.progress(0.0, text="Sweeping carbon prices…")
+    frontier = abatement_frontier(
+        price, carbon, dt_hours, n_points=sweep_n, **sweep_kw,
+        _progress=lambda f, m: _f_prog.progress(min(f, 1.0), text=m),
+    )
+    _f_prog.empty()
+
+    _t_prog = st.progress(0.0, text="Solving for your target…")
+    target_sol = solve_for_target(
+        price, carbon, dt_hours, target=target_value_in, target_kind=target_kind,
+        frontier=frontier, **sweep_kw,
+        _progress=lambda f, m: _t_prog.progress(min(f, 1.0), text=m),
+    )
+    _t_prog.empty()
+    carbon_price = target_sol.carbon_price
+    unit = "$/tonne" if target_kind == "average_cost" else "%"
+    if target_sol.reached:
+        st.success(
+            f"Hit your target of {target_sol.target:,.1f} {unit} at a **marginal "
+            f"abatement cost of ${carbon_price:,.0f}/tonne** "
+            f"(achieved {target_sol.achieved:,.1f} {unit}, {target_sol.n_solves} solves)."
+        )
+    else:
+        reach = (f"Achievable range is {target_sol.reachable_min:,.1f} to "
+                 f"{target_sol.reachable_max:,.1f} {unit}."
+                 if np.isfinite(target_sol.reachable_min) else "")
+        st.warning(
+            f"**Could not hit {target_sol.target:,.1f} {unit}.** {target_sol.note} {reach} "
+            f"Showing the closest operating point instead: marginal abatement cost "
+            f"${carbon_price:,.0f}/tonne, achieving "
+            + ("no measurable abatement" if not np.isfinite(target_sol.achieved)
+               else f"{target_sol.achieved:,.1f} {unit}") + "."
+        )
 
 _run_prog = st.progress(0.0, text="Solving dispatch…")
 comp = run_comparison(
@@ -358,19 +444,29 @@ def _stat(label, value, tip):
             f"<div style='font-size:1.7rem; font-weight:600; color:#000;'>{value}</div></div>")
 
 
+marg_str = f"&#36;{carbon_price:,.0f} / tonne"
 st.markdown(
     "<div style='background-color:#d1e49f; border:1px solid #83c341; border-radius:8px; "
     "padding:14px 18px; margin:10px 0;'>"
     "<div style='font-weight:700; margin-bottom:10px;'>Model B (Price+CO2) vs Model A "
     "(Price-optimized) — modeled, perfect foresight</div>"
     "<div style='display:flex; gap:28px; flex-wrap:wrap;'>"
-    + _stat("Realized abatement cost", ac_str,
-            "Revenue foregone divided by tonnes abated (the carbon-price input is arbitrary).")
+    + _stat("Marginal abatement cost", marg_str,
+            "What the optimizer pays for the last and most expensive tonne abated.")
+    + _stat("Average abatement cost", ac_str,
+            "Total revenue foregone divided by total tonnes abated, across all abatement.")
     + _stat("CO2 abated", co2_str, "Model A net emissions minus Model B net emissions.")
     + _stat("Revenue foregone (%)", rev_str,
             "Model A revenue minus Model B revenue; percent is of the max (Model A) revenue.")
     + "</div></div>",
     unsafe_allow_html=True,
+)
+st.caption(
+    "**Marginal** is the cost of the last tonne; **average** is the cost across every "
+    "tonne abated. Average sits below marginal because the cheaper tonnes are abated "
+    "too — the two are not meant to match. Quote the average when reporting what "
+    "carbon-aware operation cost; quote the marginal when comparing against a carbon "
+    "price, an internal price on carbon, or the cost of buying abatement elsewhere."
 )
 
 # Data-quality tripwires
@@ -573,9 +669,9 @@ with t_high:
 # --------------------------------------------------------------------------- #
 st.subheader("4. Revenue vs CO2 tradeoff")
 curve_slot = st.empty()
-if compute_curve:
+if compute_curve and frontier is None:
     curve_slot.caption("Computing the abatement curve — the rest of the page loads first…")
-else:
+elif not compute_curve:
     curve_slot.info("Abatement curve disabled — enable **Compute abatement curve** in the sidebar.")
 
 # --------------------------------------------------------------------------- #
@@ -681,16 +777,15 @@ st.download_button("Download dispatch CSV", buf.getvalue(), file_name="dispatch_
 # --------------------------------------------------------------------------- #
 if compute_curve:
     with curve_slot.container():
-        _cur_prog = st.progress(0.0, text="Computing abatement curve…")
-        fr = abatement_frontier(
-            price, carbon, dt_hours,
-            power_mw=power_mw, power_discharge_mw=power_discharge_mw,
-            energy_mwh=energy_mwh, rte=rte_pct / 100.0, carbon_units=carbon_units,
-            n_points=n_points, soc_init=soc_init, soc_min=soc_min, cycle_cost=cycle_cost,
-            terminal_soc=terminal_soc, mip_gap=MIP_GAP, time_limit=SOLVE_TIME_LIMIT,
-            solve_fn=cached_solve,
-            _progress=lambda f, m: _cur_prog.progress(min(f, 1.0), text=m))
-        _cur_prog.empty()
+        if frontier is not None:
+            # Already paid for above, to invert the target. Nothing more to solve.
+            fr = frontier
+        else:
+            _cur_prog = st.progress(0.0, text="Computing abatement curve…")
+            fr = abatement_frontier(
+                price, carbon, dt_hours, n_points=n_points, **sweep_kw,
+                _progress=lambda f, m: _cur_prog.progress(min(f, 1.0), text=m))
+            _cur_prog.empty()
         if not (abs(fr.baseline_revenue) > 1e-9 and abs(fr.max_avoided_tonnes) > 1e-9):
             st.caption("Tradeoff curve unavailable: this scenario has ~zero max revenue or ~zero "
                        "avoidable CO2, so the percentages are undefined.")
@@ -724,7 +819,9 @@ if compute_curve:
             allv = np.concatenate([y_rev, y_co2])
             lo = min(0.0, np.floor(np.nanmin(allv) / 25) * 25)
             hi = max(100.0, np.ceil(np.nanmax(allv) / 25) * 25)
-            fig_mac.update_xaxes(title_text="Realized abatement cost ($/tonne CO2)")
+            fig_mac.update_xaxes(
+                title_text="Average abatement cost<br><sub>revenue foregone per tonne "
+                           "of CO2 abated ($/tonne)</sub>")
             fig_mac.update_yaxes(title_text="% of max revenue", secondary_y=False, range=[lo, hi],
                                  dtick=25, color=BASELINE_COLOR,
                                  tickfont=dict(color=BASELINE_COLOR), title_font=dict(color=BASELINE_COLOR))
@@ -735,7 +832,8 @@ if compute_curve:
                                   legend=dict(orientation="h", y=-0.2), margin=dict(t=40, b=40))
             st.plotly_chart(fig_mac, width="stretch")
             st.caption(
-                "Realized abatement cost is revenue foregone / tonnes abated — the actual \\$/tonne "
-                "(different than the carbon-price input). Dotted lines: A: price optimized (\\$0/t) "
-                "and price+CO2 co-optimized operating points."
+                "Average abatement cost is revenue foregone / tonnes abated, across all "
+                "abatement — lower than the marginal cost that produced it, because the "
+                "cheaper tonnes are included. Dotted lines mark the price-optimized "
+                "(\\$0/t) and price+CO2 co-optimized operating points."
             )
