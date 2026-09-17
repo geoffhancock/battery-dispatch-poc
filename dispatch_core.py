@@ -296,8 +296,11 @@ def solve_chunked(
     Solver memory grows with the number of intervals (roughly 10 KB each, dominated
     by HiGHS working memory rather than by the binaries), so a full year of
     5-minute data peaks near a gigabyte and will not fit a small container. Chunking
-    caps the peak at one chunk's worth regardless of horizon length, and is faster
-    too, because solve time grows faster than linearly with problem size.
+    caps the peak at one chunk's worth regardless of horizon length.
+
+    Memory is the only reason to use this -- it is not a speed optimization.
+    Repeated timings of identical runs varied by 28-128% on one machine, swamping
+    any difference between chunked and unchunked.
 
     Receding horizon: each chunk is solved over ``chunk_intervals +
     overlap_intervals`` and only the first ``chunk_intervals`` are kept, with the
@@ -307,11 +310,10 @@ def solve_chunked(
 
     This trades perfect foresight over the whole horizon for perfect foresight
     within each chunk. Measured on CAISO 2025 (105,120 five-minute intervals, a
-    10 MW / 40 MWh battery) at 30-day chunks with 5 days of overlap: revenue within
-    0.13% of the unchunked optimum and average abatement cost within 0.78%, always
-    conservative, at 295 MB peak instead of 1,188 MB and 13.3 s instead of 22.2 s.
-    Error grows with storage duration, since longer-duration assets couple across
-    boundaries more.
+    10 MW / 40 MWh battery) at 30-day chunks with 5 days of overlap: 319 MB peak
+    instead of 1,188 MB, revenue within 0.004% of the unchunked answer, and average
+    abatement cost identical to the cent. Error grows with storage duration, since
+    longer-duration assets couple across boundaries more.
 
     ``chunk_intervals`` is also the limited-lookahead knob: large chunks approximate
     perfect foresight, while one day with no overlap is a day-ahead self-schedule.

@@ -200,9 +200,14 @@ the battery at every boundary, having no reason to hold energy it will never sel
 This trades perfect foresight over the horizon for perfect foresight within each
 chunk. Measured on CAISO 2025 (105,120 intervals, 10 MW / 40 MWh, 30-day chunks
 with 5 days of overlap): peak **319 MB instead of 1,188 MB**, revenue within
-**0.004%**, and average abatement cost identical to the cent. Wall-clock is a wash
-and depends on the configuration — 22% faster starting empty, 35% slower starting
-half full. Memory is the consistent win.
+**0.004%**, and average abatement cost identical to the cent.
+
+Memory is the whole justification — do not expect a speed benefit. Repeated timings
+of identical configurations on one machine varied by 28–128% run to run (one case
+gave both 22.8 s and 51.9 s), which is larger than any difference between chunked
+and unchunked. Branch-and-bound under a gap and a time limit is sensitive to
+whatever else the host is doing, so wall-clock here is not a stable quantity to
+optimize against.
 
 The terminal-SOC lock belongs to the whole horizon, not to a chunk: the last chunk
 starts at whatever SOC it inherited and must still land on the SOC the run began
