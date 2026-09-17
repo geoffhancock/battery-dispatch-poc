@@ -382,14 +382,35 @@ already done.
 **This MVP** is the perfect-foresight **ceiling**: dispatch optimally against
 historical actuals (real-time LMP + historical MOER). Planned next:
 
-1. **Performance floor** — day-ahead self-schedule / limited lookahead (one plan
-   per day, `run_comparison` chained by daily terminal SOC). For markets with a
-   day-ahead market (CAISO, NYISO, ERCOT). WEIM/real-time-only nodes get an
-   RT-only self-dispatch mode instead.
-2. **Realistic middle** — dispatch on a *forecast*, settle on *actuals*, using the
-   already-decoupled plan/settle signals (`solve_dispatch` optimizes the forecast;
-   `evaluate` scores the actual). Needs paired data: DA-vs-RT LMP, and MOER
-   forecast vintages vs actual MOER.
+Two independent things separate this from real operation, and they are worth
+keeping apart:
+
+- **Horizon** — how far ahead the optimizer plans.
+- **Information** — whether it knows actual future prices or only a forecast.
+
+Shortening the horizon while keeping information perfect gives a *tighter ceiling*,
+not a floor. It is already available: `solve_chunked`'s `chunk_intervals` is that
+knob. Measured on the CAISO and NYISO week fixtures against a full-week optimum:
+
+| Lookahead | CAISO | NYISO |
+|---|---|---|
+| 1 day + 6h overlap | +0.03% | 0.00% |
+| 1 day, no overlap | −3.27% | −0.04% |
+| 12 hours, no overlap | −12.29% | −39.91% |
+
+So horizon is nearly free provided the optimizer can see a little past its
+commitment window — and a day-ahead scheduler submitting at noon can. The value a
+real operator loses is therefore almost entirely about **information**, which is the
+axis still untouched.
+
+1. **Dispatch on a forecast, settle on actuals** — the one that matters. The seam
+   already exists: `solve_dispatch` optimizes whichever signal it is given and
+   `evaluate` scores against another, so plan and settle are decoupled. The blocker
+   is data, not code — paired DA-vs-RT LMP (present in the same files this tool is
+   used with) and MOER forecast vintages against actual MOER.
+2. **A true floor** — a naive policy such as a fixed daily schedule or a simple
+   price threshold, to bracket the ceiling from below. Nothing perfect-foresight can
+   serve as a floor, however short its horizon.
 3. **Per-project settlement mode** — DA self-schedule / DA+RT-settled deviations /
    RT-only, selectable per project.
 
