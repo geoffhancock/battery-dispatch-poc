@@ -200,12 +200,20 @@ the battery at every boundary, having no reason to hold energy it will never sel
 This trades perfect foresight over the horizon for perfect foresight within each
 chunk. Measured on CAISO 2025 (105,120 intervals, 10 MW / 40 MWh, 30-day chunks
 with 5 days of overlap): peak **319 MB instead of 1,188 MB**, revenue within
-**0.004%**, and average abatement cost identical to the cent. It costs about 25%
-more wall-clock, which is the trade for fitting in memory.
+**0.004%**, and average abatement cost identical to the cent. Wall-clock is a wash
+and depends on the configuration — 22% faster starting empty, 35% slower starting
+half full. Memory is the consistent win.
 
 The terminal-SOC lock belongs to the whole horizon, not to a chunk: the last chunk
 starts at whatever SOC it inherited and must still land on the SOC the run began
-at. That is what `terminal_soc_value` on `solve_dispatch` is for.
+at. That is what `terminal_soc_value` on `solve_dispatch` is for. Locking every
+chunk to its own start instead is 17x less accurate (−0.087% against −0.005%) and
+buys nothing.
+
+The lock matters whenever the battery starts with charge. On a year of CAISO data
+beginning half full, dropping it overstates revenue by 0.12% — the starting 20 MWh
+is sold and never bought. Beginning empty there is nothing to inflate and the
+constraint changes neither the dispatch nor the runtime.
 
 `chunk_intervals` is also the limited-lookahead knob from the roadmap below. Large
 chunks approximate perfect foresight; one day with no overlap is a day-ahead
