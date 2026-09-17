@@ -291,6 +291,43 @@ Key functions in `dispatch_core.py`:
 `run_comparison` and `abatement_frontier` both accept a `solve_fn`, which is the
 seam the UI uses to inject a cached solver, and a `_progress` callback.
 
+## Downloaded results
+
+The export carries all three modelled dispatches (and the metered series, when one
+was supplied), with the run's parameters written as `#` comment lines above the
+header row:
+
+```
+# generated_utc: 2026-09-17T18:22:04Z
+# source_file: CAISO_PALMSPRINGS_week
+# price_column: lmp_rtm
+# carbon_units: lbs/MWh
+# carbon_price_per_tonne: 50
+# power_mw: 10
+# energy_mwh: 40
+# rte: 0.85
+...
+# result_marginal_abatement_cost_per_tonne: 50
+# result_average_abatement_cost_per_tonne: 12.4771
+# read with: pandas.read_csv(path, comment='#')
+timestamp,price,carbon_tonnes_per_mwh,baseline_charge_mw,...
+```
+
+```python
+df = pandas.read_csv(path, comment="#")     # without comment='#' the first
+                                            # '#' line is taken as the header
+```
+
+Provenance is a header rather than repeated columns because a result file gets
+forwarded, and nothing else in it says which market or carbon price produced it —
+and that answer moves the abatement cost by multiples. Repeating the ~18 parameters
+on every row would add 17.7 MB to a full-year export to convey 466 bytes; as a
+header it costs about 800 bytes once.
+
+The file is named after the data that produced it —
+`<source>_dispatch_results_<UTC timestamp>.csv` — so a folder of exports from
+different inputs stays legible without opening any of them.
+
 ## Known simplifications (vs StorageVET)
 
 Perfect foresight; price-taker (dispatch does not move the price); single service

@@ -9,7 +9,9 @@ headline output is the realized marginal abatement cost ($/tonne CO2).
 """
 
 import io
+import re
 import threading
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -99,6 +101,17 @@ def cached_solve(signal, **kw):
         )
 
 
+def safe_stem(name, fallback="input"):
+    """Filename-safe stem of an uploaded file, used to name the export after it.
+
+    The download travels, so tying its name to the data that produced it is the
+    cheapest provenance there is. Anything outside [A-Za-z0-9._-] is collapsed so
+    the result is safe as a Content-Disposition filename on any platform.
+    """
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(str(name)).stem).strip("._-")
+    return stem[:60] or fallback
+
+
 def guess_col(cols, *keywords):
     """Return the index of the first column whose name contains any keyword."""
     lower = [c.lower() for c in cols]
@@ -142,10 +155,13 @@ with col_b:
     use_demo = st.button("Load synthetic demo", width="stretch")
 
 df = None
+source_name = "input"
 if uploaded is not None:
     df = pd.read_csv(uploaded)
+    source_name = safe_stem(uploaded.name)
 elif use_demo or st.session_state.get("_demo_loaded"):
     df = load_sample()
+    source_name = "synthetic_demo"
     st.session_state["_demo_loaded"] = True
     st.info("Loaded the synthetic demo week (168 hourly intervals).")
 
@@ -802,11 +818,66 @@ out = pd.DataFrame({
     "carbon_aware_charge_mw": comp.carbon_aware.charge_mw,
     "carbon_aware_discharge_mw": comp.carbon_aware.discharge_mw,
     "carbon_aware_soc_mwh": comp.carbon_aware.soc_mwh,
+    "carbon_max_charge_mw": comp.carbon_max.charge_mw,
+    "carbon_max_discharge_mw": comp.carbon_max.discharge_mw,
+    "carbon_max_soc_mwh": comp.carbon_max.soc_mwh,
 })
+if actual_net is not None:
+    out["actual_net_mw"] = actual_net
+
+# Provenance as a comment header rather than repeated columns: a downloaded file
+# gets forwarded, and without this nothing in it says which market or carbon price
+# produced it -- and the answer moves the abatement cost by multiples, not percents.
+# Read back with pd.read_csv(path, comment="#"); without that argument pandas takes
+# the first '#' line as the header, so the hint is written into the file itself.
+_chunked = len(comp.price) > CHUNK_THRESHOLD_INTERVALS
+meta = [
+    ("generated_utc", pd.Timestamp.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")),
+    ("source_file", source_name),
+    ("price_column", price_col),
+    ("carbon_column", carbon_col),
+    ("carbon_units", carbon_units),
+    ("actual_dispatch_column", actual_col if actual_net is not None else "(none)"),
+    ("intervals", len(comp.price)),
+    ("interval_hours", f"{dt_hours:.8g}"),
+    ("input_mode", target_mode),
+    ("input_target", "n/a" if target_sol is None else f"{target_sol.target:g}"),
+    ("input_target_reached", "n/a" if target_sol is None else target_sol.reached),
+    ("carbon_price_per_tonne", f"{carbon_price:g}"),
+    ("power_mw", f"{power_mw:g}"),
+    ("power_discharge_mw", f"{power_mw if power_discharge_mw is None else power_discharge_mw:g}"),
+    ("energy_mwh", f"{energy_mwh:g}"),
+    ("rte", f"{rte_pct / 100.0:g}"),
+    ("soc_init_mwh", f"{soc_init:g}"),
+    ("soc_min_mwh", f"{soc_min:g}"),
+    ("cycle_cost_per_mwh", f"{cycle_cost:g}"),
+    ("terminal_soc_locked", terminal_soc),
+    ("chunking", f"{CHUNK_DAYS}d chunks, {CHUNK_OVERLAP_DAYS}d overlap"
+                 if _chunked else "none (solved whole)"),
+    ("mip_gap", MIP_GAP),
+    ("solve_time_limit_s", SOLVE_TIME_LIMIT),
+    ("result_marginal_abatement_cost_per_tonne", f"{carbon_price:g}"),
+    ("result_average_abatement_cost_per_tonne",
+     "n/a" if np.isnan(comp.abatement_cost_per_tonne)
+     else f"{comp.abatement_cost_per_tonne:.4f}"),
+    ("result_tonnes_abated", f"{comp.tonnes_abated:.4f}"),
+    ("result_revenue_foregone", f"{comp.revenue_foregone:.2f}"),
+]
+header = "".join(f"# {k}: {v}\n" for k, v in meta)
+header += "# read with: pandas.read_csv(path, comment='#')\n"
+
 buf = io.StringIO()
 out.to_csv(buf, index=False)
-st.download_button("Download dispatch CSV", buf.getvalue(), file_name="dispatch_results.csv",
+st.download_button("Download dispatch CSV", header + buf.getvalue(),
+                   file_name=f"{source_name}_dispatch_results_"
+                             f"{pd.Timestamp.utcnow().strftime('%Y%m%dT%H%M%SZ')}.csv",
                    mime="text/csv")
+st.caption(
+    f"Includes all three modelled dispatches"
+    + (" and the metered series" if actual_net is not None else "")
+    + f". Run parameters are written as `#` comment lines at the top — read the file "
+      f"with `pandas.read_csv(path, comment='#')`."
+)
 
 # --------------------------------------------------------------------------- #
 # Deferred: compute the abatement curve LAST and fill the section-4 placeholder,

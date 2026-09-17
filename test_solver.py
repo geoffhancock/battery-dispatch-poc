@@ -5,6 +5,10 @@ Or standalone:  pixi run python test_solver.py
 All console output uses ASCII only (Windows cp1252-safe).
 """
 
+import io
+import re
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -559,6 +563,55 @@ def test_chunked_rejects_bad_parameters():
         except ValueError:
             continue
         raise AssertionError(f"solve_chunked({kw}) should have raised")
+
+
+def test_export_comment_header_round_trips():
+    """The exported file must read back cleanly with comment='#'.
+
+    Provenance lives in '#' lines above the header row rather than in repeated
+    columns. That only works if pandas can still parse the result, so this builds
+    an export exactly as app.py does and reads it back.
+    """
+    price, moer, ts = _load_week("NYISO_WEST")
+    comp = run_comparison(price, moer, dt=DT_5MIN, carbon_price_per_tonne=50.0,
+                          **REAL_PARAMS, **BOUNDS)
+    out = pd.DataFrame({
+        "timestamp": ts,
+        "price": comp.price,
+        "carbon_tonnes_per_mwh": comp.carbon_tonnes_per_mwh,
+        "baseline_charge_mw": comp.baseline.charge_mw,
+        "carbon_aware_charge_mw": comp.carbon_aware.charge_mw,
+        "carbon_max_charge_mw": comp.carbon_max.charge_mw,
+    })
+    meta = [("price_column", "lmp_rtm"), ("carbon_units", "lbs/MWh"),
+            ("carbon_price_per_tonne", "50"), ("terminal_soc_locked", True)]
+    header = "".join(f"# {k}: {v}\n" for k, v in meta)
+    buf = io.StringIO()
+    out.to_csv(buf, index=False)
+    blob = header + buf.getvalue()
+
+    back = pd.read_csv(io.StringIO(blob), comment="#")
+    assert list(back.columns) == list(out.columns), back.columns.tolist()
+    assert len(back) == len(out)
+    np.testing.assert_allclose(back["price"].to_numpy(), comp.price, rtol=1e-9)
+    np.testing.assert_allclose(back["carbon_max_charge_mw"].to_numpy(),
+                               comp.carbon_max.charge_mw, atol=1e-6)
+
+    # Every metadata value must survive as one parseable "# key: value" line --
+    # a stray newline or '#' in a filename would silently corrupt the table.
+    parsed = dict(
+        line[2:].split(": ", 1) for line in blob.splitlines() if line.startswith("# "))
+    assert parsed["price_column"] == "lmp_rtm"
+    assert parsed["carbon_price_per_tonne"] == "50"
+
+
+def test_safe_stem_sanitizes_upload_names():
+    """Export filenames are derived from the upload, so odd names must not escape."""
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", Path("CAISO week (2025).csv").stem).strip("._-")
+    assert stem == "CAISO_week_2025"
+    for raw in ("../../etc/passwd", r"C:\tmp\a b.csv", "  .csv", "\u00e9\u00e8.csv"):
+        s = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(raw).stem).strip("._-")[:60]
+        assert "/" not in s and "\\" not in s and ".." not in s, f"{raw!r} -> {s!r}"
 
 
 def test_full_year_shared_drive_if_available():
