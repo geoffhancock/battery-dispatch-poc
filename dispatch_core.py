@@ -29,11 +29,21 @@ future Pareto sweep (loop run_comparison over carbon_price).
 
 Simultaneous charge+discharge guard
 -----------------------------------
-A pure LP will run charge and discharge together on any interval where the
-*effective* signal is negative, to burn energy through round-trip losses and get
-paid/credited for the net import. We add a binary z_t only on those intervals
-(c_t <= P*z_t ; d_t <= P*(1-z_t)). A nonzero cycle_cost independently suppresses
-this, but the guard is needed when cycle_cost == 0.
+A pure LP will run charge and discharge together to burn energy through round-trip
+losses and get paid for the net import. Shrinking both sides SOC-neutrally
+(c -= d, d -= rte*d) changes the objective by d*dt*[signal_t*(1-rte) +
+cycle_cost*rte], so simultaneous dispatch is strictly suboptimal only above
+
+    T = -cycle_cost * rte / (1 - rte)
+
+A nonzero cycle_cost therefore does NOT suppress this independently -- it only
+lowers the threshold from 0 to T. At rte=0.85 and cycle_cost=$10/MWh, T is
+-$56.67/MWh, and real prices go below that. We add a binary z_t on the affected
+intervals (c_t <= P*z_t ; d_t <= P*(1-z_t)), currently keyed on signal_t < 0,
+which is exactly right when cycle_cost == 0 and conservative otherwise.
+
+The guard is load-bearing, not theoretical: on real CAISO/ERCOT/SRP weeks an
+unguarded LP finds the exploit and overstates revenue by 1.5-2.3%.
 """
 
 from __future__ import annotations

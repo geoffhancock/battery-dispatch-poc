@@ -393,6 +393,11 @@ historical actuals (real-time LMP + historical MOER). Planned next:
 3. **Per-project settlement mode** — DA self-schedule / DA+RT-settled deviations /
    RT-only, selectable per project.
 
-Also deferred: targeting a realized abatement cost directly instead of a carbon
-price; WattTime MOER API fetch (per-user auth); separate MOER/MBER columns;
+Also deferred: WattTime MOER API fetch (per-user auth); separate MOER/MBER columns;
 batch/portfolio comparison across projects.
+
+Two exact solver refinements are available but unimplemented, neither urgent now
+that a full year solves in about ten seconds: narrowing the guard from
+`signal < 0` to `signal < T` (on a CAISO year at `cycle_cost = $20`, 12,603
+binaries become 16, and ERCOT reaches zero), and solving the LP first and accepting
+it when `simultaneous_intervals == 0`, which is a proof of MILP optimality.
