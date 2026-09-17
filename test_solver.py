@@ -18,6 +18,7 @@ from dispatch_core import (
     parse_timestamps,
     run_comparison,
     signal_alignment,
+    solve_chunked,
     solve_dispatch,
     solve_for_target,
     target_value,
@@ -470,6 +471,94 @@ def test_real_week_timestamps_parse_as_uniform_five_minute():
         dt_h, n_irr, max_gap = infer_dt_hours(parsed.values)
         assert abs(dt_h - DT_5MIN) < 1e-9, f"{name}: inferred {dt_h * 60:.2f} min"
         assert n_irr == 0, f"{name}: {n_irr} irregular gaps, max {max_gap:.2f} h"
+
+
+def test_chunked_matches_whole_closely_on_real_data():
+    """Chunked dispatch must track the unchunked optimum and never beat it.
+
+    Chunking trades whole-horizon foresight for per-chunk foresight, so it can only
+    lose value. Beating the unchunked answer would mean the chunked path is solving
+    a different, easier problem -- a bug, not a win.
+    """
+    price, moer, _ = _load_week("CAISO_PALMSPRINGS")
+    whole = solve_dispatch(price, dt=DT_5MIN, **REAL_PARAMS, **BOUNDS)
+    # 2 days per chunk with 8 hours of overlap, over a 7-day week.
+    chunked = solve_chunked(price, dt=DT_5MIN, chunk_intervals=576,
+                            overlap_intervals=96, **REAL_PARAMS, **BOUNDS)
+    assert chunked.success, chunked.status
+    _bounds_hold(chunked, DT_5MIN, REAL_PARAMS)
+    assert len(chunked.charge_mw) == len(price)
+
+    ct = moer / MASS_PER_TONNE["lbs/MWh"]
+    m_w = evaluate(whole, price, ct, DT_5MIN, REAL_PARAMS["energy_mwh"])
+    m_c = evaluate(chunked, price, ct, DT_5MIN, REAL_PARAMS["energy_mwh"])
+    assert m_c.simultaneous_intervals == 0, "the guard must still bind per chunk"
+    # A two-sided band, deliberately: under the shipped mip_gap=0.01 neither result
+    # is a proven optimum, so "chunked cannot beat whole" is NOT assertable here --
+    # the smaller chunk problems land nearer true optimality and their stitched
+    # total can legitimately come out slightly ahead. The one-sided property is
+    # tested against a real optimum in the test below.
+    assert abs(m_c.revenue - m_w.revenue) <= 0.05 * abs(m_w.revenue), (
+        f"chunked ${m_c.revenue:,.0f} differs from unchunked ${m_w.revenue:,.0f} "
+        f"by more than 5%; the handoff is losing value")
+
+
+def test_chunked_cannot_beat_a_proven_optimum():
+    """Chunking trades horizon foresight for per-chunk foresight, so it can only
+    lose value -- provided both sides are solved to proven optimality.
+
+    Kept to a single day so the tight-gap solve stays quick. Branch-and-bound time
+    scales badly with binary count: a full CAISO week (~765 binaries) takes minutes
+    to prove, three days (~330) takes over a minute, one day (~110) takes seconds.
+    """
+    price, _, _ = _load_week("CAISO_PALMSPRINGS")
+    price = price[:288]                              # 1 day at 5-minute resolution
+    tight = dict(mip_gap=1e-9, time_limit=120)
+    whole = solve_dispatch(price, dt=DT_5MIN, **REAL_PARAMS, **tight)
+    chunked = solve_chunked(price, dt=DT_5MIN, chunk_intervals=96,
+                            overlap_intervals=24, **REAL_PARAMS, **tight)
+    assert whole.success and chunked.success
+    assert chunked.objective <= whole.objective + 1e-6, (
+        f"chunked {chunked.objective:,.2f} beat the proven optimum "
+        f"{whole.objective:,.2f}")
+
+
+def test_chunked_respects_soc_continuity_and_terminal_lock():
+    """SOC must carry across boundaries and still return home at the very end."""
+    price, _, _ = _load_week("SRP")
+    r = solve_chunked(price, dt=DT_5MIN, chunk_intervals=576, overlap_intervals=96,
+                      soc_init=10.0, terminal_soc=True,
+                      power_mw=10.0, energy_mwh=40.0, rte=0.85, soc_min=0.0,
+                      **BOUNDS)
+    assert r.success
+    assert abs(r.soc_mwh[-1] - 10.0) < 1e-4, "terminal SOC lock not applied at the end"
+    # The stitched SOC path must obey the battery's own energy balance everywhere,
+    # which is what catches an off-by-one at a chunk seam.
+    eta = np.sqrt(0.85)
+    expected = 10.0 + np.cumsum(eta * r.charge_mw * DT_5MIN
+                                - r.discharge_mw * DT_5MIN / eta)
+    assert np.allclose(r.soc_mwh, expected, atol=1e-4), "SOC path breaks at a seam"
+
+
+def test_chunked_absorbs_a_short_tail():
+    """A remainder shorter than half a chunk is absorbed, not solved as a stub."""
+    price, _, _ = _load_week("NYISO_WEST")          # 2,016 intervals
+    r = solve_chunked(price, dt=DT_5MIN, chunk_intervals=900, overlap_intervals=0,
+                      **REAL_PARAMS, **BOUNDS)
+    assert r.success
+    assert len(r.charge_mw) == len(price)
+    # 2,016 = 900 + 900 + 216; the 216 tail is under half a chunk, so 2 chunks.
+    assert "2 chunks" in r.status, r.status
+
+
+def test_chunked_rejects_bad_parameters():
+    price, _, _ = _load_week("NYISO_WEST")
+    for kw in (dict(chunk_intervals=0), dict(chunk_intervals=100, overlap_intervals=-1)):
+        try:
+            solve_chunked(price, dt=DT_5MIN, **kw, **REAL_PARAMS)
+        except ValueError:
+            continue
+        raise AssertionError(f"solve_chunked({kw}) should have raised")
 
 
 def test_full_year_shared_drive_if_available():

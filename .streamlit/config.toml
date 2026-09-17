@@ -1,6 +1,12 @@
 # WattTime brand-aligned theme (see BRAND.md).
 # Note: Lexend Deca / Poppins are not bundled with Streamlit; the app falls back
 # to the default sans-serif. Load the brand fonts before publishing externally.
+
+[server]
+# The MAX_INTERVALS row cap in app.py is checked only AFTER pandas parses the
+# upload, so an oversized file would exhaust memory before the cap could apply.
+# 20 MB comfortably holds a year of 5-minute data with several signal columns.
+maxUploadSize = 20
 [theme]
 base = "light"
 backgroundColor = "#ffffff"

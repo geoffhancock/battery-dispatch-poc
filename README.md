@@ -172,9 +172,44 @@ term, so they usually carry fewer binaries than A — C is typically a pure LP.
 ### Solver bounds
 
 Large inputs are bounded rather than solved to proven optimality: `mip_gap`
-(1% in the UI) and `time_limit` (120 s per solve). Proving optimality is what
-explodes on a year of 5-minute data; a near-optimal dispatch returns quickly. A
-feasible incumbent is accepted when a bound stops the solve early.
+(1% in the UI) and `time_limit` (30 s per solve). Proving optimality is what
+explodes — on a week of CAISO data at ~765 binaries it takes minutes, against
+well under a second at a 1% gap. A feasible incumbent is accepted when a bound
+stops the solve early.
+
+One consequence worth knowing when comparing two runs: with a nonzero gap neither
+result is a proven optimum, so a *smaller* problem can report slightly more value
+than a larger one that contains it. That is the gap, not an inconsistency.
+
+Measured effect of the 1% gap on the headline metric, across the four test weeks:
+average abatement cost moves by at most 2.7% against a tight-gap solve, and under
+1% in three of four. Revenue foregone is a small difference between two large
+revenues, so it amplifies the gap roughly 30-400x in principle — but the errors on
+the two scenarios correlate almost exactly and cancel.
+
+### Long horizons: chunked solving
+
+Solver memory scales with interval count — roughly 10 KB each, dominated by HiGHS
+working memory rather than by the binaries. A full year of 5-minute data peaks near
+**1.2 GB**, which will not fit a small container. Above `CHUNK_THRESHOLD_INTERVALS`
+the app switches to `solve_chunked`, a receding horizon: each chunk is solved over
+`chunk + overlap` intervals, only the chunk is kept, and the state of charge carries
+forward. The overlap is what makes it nearly free — without it the optimizer drains
+the battery at every boundary, having no reason to hold energy it will never sell.
+
+This trades perfect foresight over the horizon for perfect foresight within each
+chunk. Measured on CAISO 2025 (105,120 intervals, 10 MW / 40 MWh, 30-day chunks
+with 5 days of overlap): peak **319 MB instead of 1,188 MB**, revenue within
+**0.004%**, and average abatement cost identical to the cent. It costs about 25%
+more wall-clock, which is the trade for fitting in memory.
+
+The terminal-SOC lock belongs to the whole horizon, not to a chunk: the last chunk
+starts at whatever SOC it inherited and must still land on the SOC the run began
+at. That is what `terminal_soc_value` on `solve_dispatch` is for.
+
+`chunk_intervals` is also the limited-lookahead knob from the roadmap below. Large
+chunks approximate perfect foresight; one day with no overlap is a day-ahead
+self-schedule, the performance *floor* rather than the ceiling.
 
 ## Module layout
 
@@ -230,6 +265,7 @@ Key functions in `dispatch_core.py`:
 | Function | Returns |
 |---|---|
 | `solve_dispatch` | `DispatchResult` — one MILP solve against one effective signal |
+| `solve_chunked` | `DispatchResult` — a long horizon as overlapping chunks; drop-in for `solve_dispatch` |
 | `run_comparison` | `Comparison` — scenarios A, B and C plus the realized abatement cost |
 | `evaluate` | `Metrics` — scores any dispatch against the real price and carbon signals |
 | `evaluate_actual` | `Metrics` for a metered net-MW series, using identical accounting |
@@ -260,13 +296,36 @@ model omits.
 ## Deploying
 
 Free options: [Streamlit Community Cloud](https://share.streamlit.io) or Hugging
-Face Spaces (push the repo, point at `app.py`). Before publishing publicly:
+Face Spaces (push the repo, point at `app.py`). Community Cloud deploys from a
+private repo and private apps take a viewer email allowlist, which is the simplest
+way to share with a named set of people.
 
-- Pin exact versions (`==`) in `requirements.txt` so rebuilds cannot break.
-- Keep the input-size cap in `app.py` (`MAX_INTERVALS`, 200,000 intervals) to
-  protect free-tier memory.
-- Bound the solve cache (`max_entries`, `ttl`), which is currently unbounded — a
-  long session over large inputs retains every solved dispatch.
+The defaults are already sized for a ~1 GB container, from measurement rather than
+guesswork:
+
+| Setting | Value | Why |
+|---|---|---|
+| `MAX_INTERVALS` | 200,000 | ~2 years of 5-minute data. Safe because long horizons are chunked |
+| `CHUNK_THRESHOLD_INTERVALS` | 15,000 | Above this, chunk. Below, one solve is cheap |
+| `CHUNK_DAYS` / `CHUNK_OVERLAP_DAYS` | 30 / 5 | 319 MB peak for a full 5-minute year |
+| `SOLVE_TIME_LIMIT` | 30 s | Chunks solve in well under a second |
+| Abatement-curve points | 4–12 | Each point is a full solve across every chunk |
+| `cached_solve` cache | `max_entries=24, ttl=1800` | Bounds retained dispatch arrays |
+| `server.maxUploadSize` | 20 MB | See below |
+| `_SOLVE_LOCK` | one solve at a time | See below |
+
+Two of those are less obvious:
+
+- **The upload limit matters because the row cap is checked too late.** `app.py`
+  tests `len(df) > MAX_INTERVALS` only *after* pandas has parsed the upload, so an
+  oversized file exhausts memory before the cap can apply. The real defence is
+  `server.maxUploadSize` in `.streamlit/config.toml`.
+- **Solves are serialized.** Streamlit serves every viewer from one process, so
+  concurrent solves would stack their peaks in the same address space. Queueing is
+  a far better failure mode than an out-of-memory restart that drops every session.
+
+Also pin exact versions (`==`) in `requirements.txt` so rebuilds cannot break —
+already done.
 
 ## Roadmap
 

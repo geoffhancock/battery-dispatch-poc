@@ -9,6 +9,7 @@ headline output is the realized marginal abatement cost ($/tonne CO2).
 """
 
 import io
+import threading
 
 import numpy as np
 import pandas as pd
@@ -24,6 +25,7 @@ from dispatch_core import (
     parse_timestamps,
     run_comparison,
     signal_alignment,
+    solve_chunked,
     solve_dispatch,
     solve_for_target,
 )
@@ -41,7 +43,18 @@ MAX_INTERVALS = 200_000
 # full year of 5-min data can blow up to a hang. A 1% gap + time limit returns a
 # near-optimal dispatch fast (proving exact optimality is what explodes).
 MIP_GAP = 0.01
-SOLVE_TIME_LIMIT = 120  # seconds per solve
+SOLVE_TIME_LIMIT = 30  # seconds per solve (chunks measure well under 1s)
+
+# Long horizons are solved in overlapping chunks. Solver memory scales with interval
+# count -- a full 5-minute year peaks near 1.2 GB unchunked, versus ~295 MB at these
+# settings, and runs faster besides. Expressed in days and converted with dt so the
+# same thresholds work for hourly and 5-minute data.
+CHUNK_THRESHOLD_INTERVALS = 15_000
+CHUNK_DAYS = 30
+CHUNK_OVERLAP_DAYS = 5
+# One solve at a time: Streamlit serves every viewer from one process, so concurrent
+# solves would stack their peaks in the same address space.
+_SOLVE_LOCK = threading.Lock()
 
 # Scenario naming (see the "Model A / Model B" key under Results).
 A_BRIEF, B_BRIEF, CMAX_BRIEF, ACT_BRIEF = (
@@ -62,13 +75,28 @@ def load_sample():
     return pd.read_csv("sample_signals_week.csv")
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, max_entries=24, ttl=1800)
 def cached_solve(signal, **kw):
-    """Cache one MILP solve keyed on the signal array + params. run_comparison /
+    """Cache one solve keyed on the signal array + params. run_comparison /
     abatement_frontier are called UNCACHED (their assembly is cheap) with this as
     solve_fn, so the progress bar can be driven from the main thread while the
-    heavy solves stay cached across reruns."""
-    return solve_dispatch(signal, **kw)
+    heavy solves stay cached across reruns.
+
+    Long horizons are chunked here rather than inside the callers, so every path --
+    comparison, frontier, target search -- inherits it from one place. Bounded
+    entries keep the cache from growing without limit on a small host.
+    """
+    n = len(signal)
+    with _SOLVE_LOCK:
+        if n <= CHUNK_THRESHOLD_INTERVALS:
+            return solve_dispatch(signal, **kw)
+        per_day = 24.0 / kw["dt"]
+        return solve_chunked(
+            signal,
+            chunk_intervals=max(1, int(round(CHUNK_DAYS * per_day))),
+            overlap_intervals=max(0, int(round(CHUNK_OVERLAP_DAYS * per_day))),
+            **kw,
+        )
 
 
 def guess_col(cols, *keywords):
@@ -262,7 +290,7 @@ compute_curve = st.sidebar.checkbox(
     "Compute abatement curve", value=True,
     help="Section 4 runs extra solves (one per curve point) to trace revenue vs CO2. "
          "Uncheck to skip it for much faster runs on large datasets.")
-n_points = st.sidebar.slider("Abatement-curve points", 4, 20, 10,
+n_points = st.sidebar.slider("Abatement-curve points", 4, 12, 10,
                              help="Carbon prices swept for the abatement curve. "
                                   "More points = smoother curve but more solves.")
 
