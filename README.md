@@ -396,8 +396,22 @@ historical actuals (real-time LMP + historical MOER). Planned next:
 Also deferred: WattTime MOER API fetch (per-user auth); separate MOER/MBER columns;
 batch/portfolio comparison across projects.
 
-Two exact solver refinements are available but unimplemented, neither urgent now
-that a full year solves in about ten seconds: narrowing the guard from
-`signal < 0` to `signal < T` (on a CAISO year at `cycle_cost = $20`, 12,603
-binaries become 16, and ERCOT reaches zero), and solving the LP first and accepting
-it when `simultaneous_intervals == 0`, which is a proof of MILP optimality.
+Deliberately **not** pursuing two solver refinements that look attractive on paper.
+Recording them so they are not rediscovered and re-proposed:
+
+- **Narrowing the guard from `signal < 0` to `signal < T`.** It does cut binaries
+  sharply (a CAISO year at `cycle_cost = $20` goes from 12,603 to 16), but binaries
+  are not the cost. That same year solves in 9.8 s with all 12,603, against 8.6 s
+  for a NYISO year with 205 — a 61x difference in binary count for no measurable
+  time. The LP relaxation is already nearly integral, so branch-and-bound
+  terminates almost at once. Peak memory tracks interval count, not binaries, so
+  there is nothing to win there either. And with the default `cycle_cost = 0`,
+  `T = 0` and the narrowed guard is identical to the current one.
+- **Solving the LP first and accepting it when `simultaneous_intervals == 0`,**
+  which would be a valid proof of MILP optimality. The LP is not reliably faster:
+  on a CAISO year it was 1.1x (9.32 s against 9.81 s), and on a NYISO year it ran
+  600 s and returned nothing where the MILP took 8.6 s.
+
+Chunking retired the premise behind both. No solve now exceeds about 10,000
+intervals however large the upload, and one of those takes 0.54 s with 1,883
+binaries. Revisit only if the interval cap changes by an order of magnitude.
