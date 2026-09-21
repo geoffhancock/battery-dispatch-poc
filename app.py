@@ -128,7 +128,8 @@ st.title("🔋 Battery Dispatch Solver")
 st.caption(
     "Perfect-foresight, price-taking battery. Compares a price-only baseline "
     "against a carbon-aware co-optimized dispatch. Open-source lightweight "
-    "alternative to StorageVET for the single-service (energy-arbitrage) case."
+    "alternative to more complex dispatch solvers for the single-service "
+    "(energy-arbitrage) case."
 )
 with st.expander("About this MVP — assumptions"):
     st.markdown(
